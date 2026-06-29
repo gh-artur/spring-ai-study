@@ -298,6 +298,140 @@ Depois, **desserializa** o JSON da resposta no objeto (`CountryCities`).
 
 ---
 
+## 7. Chat Memory (histórico da conversa)
+
+Por padrão o LLM é **stateless**: cada chamada é independente, ele não lembra do que foi dito antes. O **Chat Memory** resolve isso guardando o histórico das mensagens e reenviando junto a cada nova requisição, dando a sensação de conversa contínua.
+
+### Como é montado neste projeto
+
+Um `ChatClient` dedicado (`chatMemoryChatClient`) com o `MessageChatMemoryAdvisor` registrado como default advisor:
+
+```java
+@Bean(name = "chatMemoryChatClient")
+public ChatClient chatClient(ChatClient.Builder chatClientBuilder, ChatMemory chatMemory) {
+    SimpleLoggerAdvisor loggerAdvisor = SimpleLoggerAdvisor.builder().build();
+    MessageChatMemoryAdvisor memoryAdvisor = MessageChatMemoryAdvisor.builder(chatMemory).build();
+
+    return chatClientBuilder
+            .defaultAdvisors(List.of(loggerAdvisor, memoryAdvisor))
+            .build();
+}
+```
+
+E o controller seta o **id da conversa** por requisição, usando o `username` que vem no header:
+
+```java
+@GetMapping("/chat-memory")
+public String chat(@RequestHeader("username") String username,
+                   @RequestParam String message) {
+    return chatClient
+            .prompt()
+            .user(message)
+            .advisors(spec -> spec.param(ChatMemory.CONVERSATION_ID, username))
+            .call()
+            .content();
+}
+```
+
+### As três peças
+
+| Peça | Papel |
+|------|-------|
+| `ChatMemory` | A **abstração** que armazena/recupera as mensagens de uma conversa. Por default o Spring AI auto-configura `MessageWindowChatMemory` + `InMemoryChatMemoryRepository`; aqui o bean é declarado manualmente com `JdbcChatMemoryRepository` e janela de 10 (ver subseção de janela). |
+| `MessageChatMemoryAdvisor` | O **advisor** que, antes de chamar o modelo, carrega o histórico daquela conversa e injeta no prompt; depois, salva a nova troca (user + assistant). |
+| `ChatMemory.CONVERSATION_ID` | A **chave** que separa as conversas. Cada valor distinto = um histórico isolado. Aqui usamos o `username` → cada usuário tem sua própria memória. |
+
+### Como funciona o ciclo (é um advisor, ligado à seção 4)
+
+1. Chega a requisição com `conversationId = username`.
+2. O `MessageChatMemoryAdvisor` **lê** o histórico desse id no `ChatMemory` e **prepende** as mensagens antigas ao prompt (pré-processamento — antes do `chain.nextCall`).
+3. O modelo responde já "lembrando" do contexto.
+4. O advisor **grava** a nova mensagem do user e a resposta do assistant no `ChatMemory` (pós-processamento).
+
+### `MessageChatMemoryAdvisor` vs `PromptChatMemoryAdvisor`
+- `MessageChatMemoryAdvisor` → injeta o histórico como **mensagens separadas** (user/assistant) na lista de mensagens. É o mais comum.
+- `PromptChatMemoryAdvisor` → injeta o histórico como **texto dentro do system prompt**. Útil para modelos que não lidam bem com muitas mensagens de papéis distintos.
+
+### Janela de mensagens (`MessageWindowChatMemory`)
+O `MessageWindowChatMemory` **limita o número de mensagens por conversa** (default ~20) — as mais antigas são descartadas para a conversa não crescer infinito e estourar tokens. É **por `conversationId`**, não global.
+
+Neste projeto o bean foi configurado **manualmente** para usar o repositório JDBC e uma janela de **10 mensagens**:
+
+```java
+@Bean
+ChatMemory chatMemory(JdbcChatMemoryRepository jdbcChatMemoryRepository) {
+    return MessageWindowChatMemory.builder()
+            .maxMessages(10)                              // janela: últimas 10 mensagens
+            .chatMemoryRepository(jdbcChatMemoryRepository)
+            .build();
+}
+```
+
+> `maxMessages(10)` conta **mensagens totais** (user **+** assistant), ou seja ~5 trocas — **não** 10 perguntas. Mensagens de `system` ficam de fora da contagem (são preservadas).
+
+#### Por que as mensagens antigas somem *do banco* (e não só do prompt)
+A cada `add`, o `MessageWindowChatMemory` não apenas filtra o que envia ao modelo: ele
+1. **lê** o histórico atual do repositório,
+2. junta com as novas mensagens,
+3. **corta para as últimas N** (a janela), e
+4. **regrava a janela inteira** via `saveAll`.
+
+No `JdbcChatMemoryRepository`, esse `saveAll` é um **`DELETE` por `conversationId` seguido de `INSERT`** da janela. Resultado: a tabela `SPRING_AI_CHAT_MEMORY` guarda **apenas a janela**, nunca o histórico completo — por isso, ao mandar mensagens novas, você viu as linhas antigas **desaparecerem fisicamente** da tabela.
+
+> Consequência: a janela é a "fonte da verdade". Se quiser **auditoria/histórico completo**, não dá pra confiar nessa tabela — precisaria persistir as mensagens à parte (outra tabela/append-only), pois o `MessageWindowChatMemory` poda o que excede a janela.
+
+### Pontos de atenção
+- **`InMemoryChatMemoryRepository` é volátil**: o histórico vive na heap da aplicação → some ao reiniciar e não é compartilhado entre instâncias. Para persistir/escalar existem repositórios de JDBC, Cassandra, Redis, etc. (trocar o bean `ChatMemoryRepository`).
+- **Número de conversas cresce sem limite**: a janela limita mensagens *dentro* de cada conversa, mas cada novo `username` cria um histórico novo que nunca expira sozinho.
+- **`username` por header não é autenticação**: qualquer um pode mandar o header de outro e acessar/poluir aquele histórico. Em produção o id viria do contexto de segurança (usuário autenticado), não de um header livre.
+- O histórico **gasta tokens de prompt** a cada chamada (cresce até o limite da janela) — dá pra observar no `TokenUsageAuditAdvisor` (seção 4).
+
+### Persistindo em banco (JDBC + H2)
+Para o histórico **sobreviver ao restart**, troca-se o repositório volátil por um persistente. Com o starter JDBC, **não muda nenhuma linha de código** (advisor e controller seguem iguais) — só dependências + properties.
+
+**Dependências (`pom.xml`):**
+```xml
+<!-- substitui o InMemoryChatMemoryRepository pelo JdbcChatMemoryRepository -->
+<dependency>
+    <groupId>org.springframework.ai</groupId>
+    <artifactId>spring-ai-starter-model-chat-memory-repository-jdbc</artifactId>
+</dependency>
+<dependency>
+    <groupId>com.h2database</groupId>
+    <artifactId>h2</artifactId>
+    <scope>runtime</scope>
+</dependency>
+<dependency> <!-- opcional: console web em /h2-console -->
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-h2console</artifactId>
+</dependency>
+```
+
+**Properties (`application.properties`):**
+```properties
+spring.datasource.url=jdbc:h2:file:C:\\git\\...\\chatmemory;AUTO_SERVER=true
+spring.datasource.driver-class-name=org.h2.Driver
+spring.datasource.username=username
+spring.datasource.password=password
+
+# cria a tabela SPRING_AI_CHAT_MEMORY no startup (create table if not exists)
+spring.ai.chat.memory.repository.jdbc.initialize-schema=always
+```
+
+Como funciona:
+1. O starter JDBC no classpath faz o Spring AI **auto-configurar o `JdbcChatMemoryRepository`** no lugar do in-memory, usando o `DataSource` do Spring. A abstração `ChatMemory` é a mesma — muda só **onde** ela grava.
+2. `initialize-schema=always` roda o script que cria a tabela `SPRING_AI_CHAT_MEMORY`.
+3. As trocas (user/assistant) passam a ser **gravadas e lidas do banco** por `conversationId`.
+
+> ⚠️ **`file:` vs `mem:` — o detalhe que faz o estado sobreviver.**
+> `jdbc:h2:file:...` grava o banco **em arquivo no disco** → o histórico persiste entre reinícios.
+> `jdbc:h2:mem:...` (default de muitos tutoriais) vive só na **RAM** → seria perdido no restart, mesmo "sendo um banco". O que persiste não é *ser banco de dados*, é ser **em arquivo**.
+> `AUTO_SERVER=true` permite que mais de um processo (app + console H2) abra o mesmo arquivo ao mesmo tempo.
+
+> Trocar H2 por Postgres/MySQL é só mudar o `spring.datasource.*` e o driver — o `JdbcChatMemoryRepository` continua o mesmo.
+
+---
+
 ## Resumo geral (default vs. por requisição)
 
 | Conceito        | Global (no Builder)      | Pontual (no `prompt()`) |
@@ -312,3 +446,5 @@ Depois, **desserializa** o JSON da resposta no objeto (`CountryCities`).
 - **System / defaultSystem** = papel e regras do assistente (por chamada vs. global).
 - **Advisors / defaultAdvisors** = interceptadores da cadeia (por chamada vs. global); ex. auditoria de tokens e logging.
 - **Chat Options** = parâmetros de geração (`model`, `temperature`, `topP`/`topK`, `frequencyPenalty`, `presencePenalty`, `maxTokens`, `stopSequences`); global vs. por chamada.
+- **Structured Output** = resposta convertida direto em objeto Java (`.entity(...)` via `BeanOutputConverter`).
+- **Chat Memory** = histórico da conversa via `MessageChatMemoryAdvisor` + `ChatMemory`, isolado por `CONVERSATION_ID` (aqui o `username`); torna o LLM "com memória". Trocar o `ChatMemoryRepository` (in-memory → JDBC/H2 `file:`) faz o histórico **persistir entre reinícios**, sem mexer no código.
