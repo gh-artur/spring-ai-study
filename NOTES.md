@@ -432,6 +432,119 @@ Como funciona:
 
 ---
 
+## 8. RAG (Retrieval-Augmented Generation) com Vector Store
+
+RAG é o passo além do **Stuffing** (seção 3): em vez de enfiar um documento inteiro no prompt, você **busca só os trechos relevantes** para a pergunta e injeta apenas eles. Resolve o limite de tokens e o custo do stuffing, e dá ao LLM "conhecimento" que ele não tem no treinamento.
+
+### As duas fases do RAG
+
+| Fase | Quando | O que acontece |
+|------|--------|----------------|
+| **Ingestão (indexing)** | Uma vez / offline | Os documentos são transformados em **embeddings** (vetores) e gravados no **vector store**. |
+| **Recuperação (retrieval)** | A cada pergunta | A pergunta vira embedding, busca-se por **similaridade** os trechos mais próximos, e eles entram no prompt como contexto. |
+
+### Vector Store — o que é
+Um banco especializado em **vetores** (embeddings). Em vez de buscar por igualdade (`WHERE x = ?`), busca por **proximidade semântica**: textos com significado parecido ficam próximos no espaço vetorial. Aqui usamos o **Qdrant**, rodando via Docker Compose:
+
+```yaml
+# compose.yml
+services:
+  qdrant:
+    image: 'qdrant/qdrant:latest'
+    ports:
+      - '6333:6333'   # REST/dashboard
+      - '6334:6334'   # gRPC (usado pelo Spring AI)
+```
+
+```properties
+# application.properties
+spring.docker.compose.stop.command=down
+spring.ai.vectorstore.qdrant.initialize-schema=true   # cria a collection se não existir
+spring.ai.vectorstore.qdrant.host=localhost
+spring.ai.vectorstore.qdrant.port=6334
+spring.ai.vectorstore.qdrant.collection-name=teste
+```
+
+> O Spring Boot, com a dependência `spring-boot-docker-compose`, **sobe o `compose.yml` sozinho** no startup. O `VectorStore` é auto-configurado a partir dessas properties.
+
+### Fase 1 — Ingestão (`@PostConstruct`)
+Cada `String` vira um `Document`; o `vectorStore.add(...)` gera os embeddings (chamando o modelo de embedding do OpenAI) e grava no Qdrant:
+
+```java
+@Component
+public class RandomDataLoader {
+    private final VectorStore vectorStore;
+
+    public RandomDataLoader(VectorStore vectorStore) { this.vectorStore = vectorStore; }
+
+    @PostConstruct
+    public void loadSentencesIntoVectorStore() {
+        List<String> sentences = List.of("Java is used for ...", "Bitcoin operates on ...", /* ... */);
+        List<Document> documents = sentences.stream().map(Document::new).toList();
+        vectorStore.add(documents);   // text -> embedding -> Qdrant
+    }
+}
+```
+
+> ⚠️ **Cuidado com `@PostConstruct` para ingestão:** roda **a cada boot** da aplicação. Como o Qdrant persiste a collection e `Document::new` gera um **id novo** toda vez, reinícios sucessivos **acumulam duplicatas**. Para estudo é ok; em código real, ingestão é um passo separado/idempotente (checar se já existe, ou usar ids estáveis).
+
+### Fase 2 — Recuperação + geração (controller)
+```java
+@GetMapping("/random/chat")
+public ResponseEntity<String> randomChat(@RequestHeader("username") String username,
+                                         @RequestParam String message) {
+    // 1. busca semântica no vector store
+    SearchRequest searchRequest = SearchRequest.builder()
+            .query(message)
+            .topK(3)                  // traz os 3 trechos mais próximos
+            .similarityThreshold(0.5) // descarta os pouco relevantes (0..1)
+            .build();
+    List<Document> similarDocs = vectorStore.similaritySearch(searchRequest);
+
+    // 2. monta o contexto a partir dos trechos recuperados
+    String similarContext = similarDocs.stream()
+            .map(Document::getText)
+            .collect(Collectors.joining(System.lineSeparator()));
+
+    // 3. injeta o contexto no system prompt (template) e gera a resposta
+    String answer = chatClient.prompt()
+            .system(spec -> spec.text(promptTemplate).param("documents", similarContext))
+            .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, username)) // reusa o chat memory client
+            .user(message)
+            .call().content();
+
+    return ResponseEntity.ok(answer);
+}
+```
+
+Parâmetros da busca:
+- **`topK`** → quantos trechos trazer (mais = mais contexto, porém mais tokens).
+- **`similarityThreshold`** → corte de relevância (0 a 1). Acima do valor entra; abaixo é descartado. Evita injetar lixo quando nada é realmente parecido.
+
+### O template que "amarra" o LLM ao contexto
+A peça que transforma busca + LLM em RAG de verdade é a instrução no system prompt — responder **só** com base nos documentos:
+
+```
+You are a helpful assistant, answering questions based on the given context in the
+DOCUMENTS section and no prior knowledge. If the answer is not in the DOCUMENTS section,
+then reply with "I don't know".
+
+DOCUMENTS:
+----------
+{documents}
+----------
+```
+
+Isso reduz **alucinação**: sem contexto relevante (busca não passou do threshold), o modelo é orientado a dizer *"I don't know"* em vez de inventar.
+
+### Pontos de atenção
+- **Custo de embeddings:** tanto a ingestão quanto cada pergunta chamam o modelo de embedding (gera tokens/custo à parte do chat).
+- **Qualidade depende do retrieval:** se a busca traz o trecho errado (ou nada), a resposta degrada — RAG é "garbage in, garbage out".
+- **`topK`/`threshold` são tuning:** valores altos demais inflam tokens; baixos demais perdem contexto.
+- **Reuso do `chatMemoryChatClient`:** este controller injeta o mesmo client da seção 7 (`@Qualifier("chatMemoryChatClient")`), então a conversa RAG **também tem memória** por `username`.
+
+---
+
 ## Resumo geral (default vs. por requisição)
 
 | Conceito        | Global (no Builder)      | Pontual (no `prompt()`) |
@@ -448,3 +561,4 @@ Como funciona:
 - **Chat Options** = parâmetros de geração (`model`, `temperature`, `topP`/`topK`, `frequencyPenalty`, `presencePenalty`, `maxTokens`, `stopSequences`); global vs. por chamada.
 - **Structured Output** = resposta convertida direto em objeto Java (`.entity(...)` via `BeanOutputConverter`).
 - **Chat Memory** = histórico da conversa via `MessageChatMemoryAdvisor` + `ChatMemory`, isolado por `CONVERSATION_ID` (aqui o `username`); torna o LLM "com memória". Trocar o `ChatMemoryRepository` (in-memory → JDBC/H2 `file:`) faz o histórico **persistir entre reinícios**, sem mexer no código.
+- **RAG** = busca semântica (`vectorStore.similaritySearch`, `topK`/`threshold`) num **vector store** (Qdrant) + injeção dos trechos relevantes no system prompt; evolução do **Stuffing** que escala e reduz alucinação ("responda só pelos DOCUMENTS").
