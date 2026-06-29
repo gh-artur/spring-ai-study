@@ -120,8 +120,20 @@ definido somente após análise das outras palavras da frase.
 Define quanto de atenção deve ser dado a cada palavra.
 
 -----------
-
 ChatMemory: LLMs não guardam estado, por isso devemos manualmente informa-la sobre o que já foi dito na conversa.
+
+RAG Retrieval Augmented Generation: Da contexto relevante pra LLM. Utilizado para trazer dados que não foram usados
+no treinamento do modelo, como dados internos de uma empresa. Exemplo: Se eu tenho um livro dentro do KB (Knowledge base)
+ao executar um prompt sobre algo que está nas paginas 10 a 15 do livro, o RAG faz com que somente estas paginas sejam
+enviadas ao LLM.
+
+Diferente do Prompt Stuffing, onde todo o livro seria passado no prompt.
+
+Vector Database: Guarda informações com base em seus embeddings, entende contexto e significado, possibilitando consultas
+semanticas.
+Exemplo: Quando o usuário enviar um prompt, transformamos ele em uma query vector, que trará do vector database somente
+as informações relevantes pro prompt do usuário, pegamos este retorno e adicionamos ao llm prompt.
+
 
 
 
