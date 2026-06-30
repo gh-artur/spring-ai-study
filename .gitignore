@@ -38,3 +38,4 @@ build/
 ### H2 database (chat memory runtime data) ###
 *.mv.db
 *.lock.db
+*.trace.db

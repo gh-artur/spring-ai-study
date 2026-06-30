@@ -134,6 +134,48 @@ semanticas.
 Exemplo: Quando o usuário enviar um prompt, transformamos ele em uma query vector, que trará do vector database somente
 as informações relevantes pro prompt do usuário, pegamos este retorno e adicionamos ao llm prompt.
 
+-------------
+
+Text Splitter / Chunking: Antes de jogar um documento no vector database, quebramos ele em pedaços menores (chunks).
+Documento gigante = embedding "borrado" (mistura vários assuntos num vetor só) e, na busca, traz um bloco enorme com
+muito texto irrelevante pro prompt. Chunk pequeno = embedding focado num assunto + busca traz só o pedaço relevante.
+Na prática: carreguei um PDF SEM splitter e o prompt ficou ~1200 tokens; COM splitter caiu pra ~500. Menos token = mais
+barato, mais rápido e resposta mais focada.
+Cuidado: chunk pequeno demais corta uma ideia no meio e perde sentido; overlap (sobreposição) ajuda a não cortar bem na
+fronteira de uma ideia.
+
+-------------
+
+Busca cross-lingual: A busca vetorial compara SIGNIFICADO, não palavra. Então dá pra perguntar em português e achar
+documento em inglês, porque os embeddings da OpenAI são multilíngues ("férias" cai perto de "vacation"). Só que cross-lingual
+é mais fraco que monolíngue. Solução: traduzir a pergunta pro idioma do índice ANTES de buscar (Query Transformer).
+Importante: idioma da PERGUNTA afeta a busca; idioma da RESPOSTA é controlado pelo prompt. Dá pra buscar em inglês e
+responder em português.
+
+-------------
+
+RAG modular (pipeline): Em vez de fazer a busca na mão no controller, existe um advisor que faz o RAG inteiro sozinho.
+O pipeline tem 3 fases plugáveis:
+1. Pré (Query Transformer): mexe na pergunta antes de buscar (ex: traduzir, comprimir o histórico numa query).
+2. Retrieval (Document Retriever): de onde vêm os documentos. Pode ser o vector store OU outra fonte, tipo busca na web ao
+   vivo (ex: API Tavily). A fonte é trocável sem mexer no resto.
+3. Pós (Document Post Processor): trata o que voltou antes de mandar pro LLM (ex: mascarar dados sensíveis/PII como email e
+   telefone, re-ranking, deduplicar).
+
+-------------
+
+Semantic Cache: Cache normal só acerta com a string IDÊNTICA. Semantic cache acerta por SIGNIFICADO: guarda o embedding da
+pergunta no Redis e, se vier uma pergunta parecida o bastante (acima de um threshold de similaridade), devolve a resposta
+guardada SEM chamar o LLM.
+Hit = economiza token, custo e tempo (modelo nem roda). Miss = chama o LLM e guarda a resposta pra próxima.
+Threshold de propósito nem alto nem baixo demais: alto demais quase nunca acerta; baixo demais devolve resposta de uma
+pergunta "parecida mas diferente" (erro). Comecei com 0.9 (Redis) e depois fui pra 0.8.
+Cuidado: como ele curto-circuita antes do modelo, uma resposta cacheada pode ignorar o contexto da conversa (memória) ou
+documentos novos do RAG. Combina melhor com perguntas "soltas".
+Onde guardar o cache: pode ser no Redis OU no próprio vector database. Troquei pra usar o Qdrant (que já tava de pé pro
+RAG), assim não preciso subir outra infra só pro cache. IMPORTANTE: o cache tem que ficar numa collection SEPARADA da do
+RAG, senão as perguntas/respostas do cache viram "documento" que o RAG recupera, bagunçando os dois.
+
 
 
 

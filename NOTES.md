@@ -545,6 +545,181 @@ Isso reduz **alucinação**: sem contexto relevante (busca não passou do thresh
 
 ---
 
+## 9. RAG modular / declarativo (`RetrievalAugmentationAdvisor`)
+
+A seção 8 fez RAG **na mão**: o controller chamava `vectorStore.similaritySearch`, montava o contexto e injetava no template. Funciona, mas mistura a lógica de RAG dentro do endpoint.
+
+O Spring AI oferece o **`RetrievalAugmentationAdvisor`**: um advisor (seção 4) que faz todo o pipeline de RAG sozinho, antes da chamada ao modelo. O controller volta a ser só `.user(message).call()` — toda a recuperação acontece na cadeia de advisors.
+
+### O pipeline em 3 fases (módulos plugáveis)
+
+| Fase | Interface | O que faz | Implementação neste projeto |
+|------|-----------|-----------|-----------------------------|
+| **Pré-retrieval** | `QueryTransformer` | Reescreve a **query** antes da busca | `TranslationQueryTransformer` (traduz p/ inglês) |
+| **Retrieval** | `DocumentRetriever` | Busca os documentos relevantes | `VectorStoreDocumentRetriever` (Qdrant) e o custom `WebSearchDocumentRetriever` (Tavily) |
+| **Pós-retrieval** | `DocumentPostProcessor` | Trata os docs recuperados antes de injetar | `PIIMaskingDocumentPostProcessor` (mascara PII) |
+
+```java
+@Bean
+RetrievalAugmentationAdvisor retrievalAugmentationAdvisor(VectorStore vectorStore,
+                                                          ChatClient.Builder chatClientBuilder) {
+    return RetrievalAugmentationAdvisor.builder()
+            .queryTransformers(TranslationQueryTransformer.builder()
+                    .chatClientBuilder(chatClientBuilder.clone())   // chama o LLM p/ traduzir
+                    .targetLanguage("english")
+                    .build())
+            .documentRetriever(VectorStoreDocumentRetriever.builder()
+                    .vectorStore(vectorStore)
+                    .topK(3)
+                    .similarityThreshold(0.5)
+                    .build())
+            .documentPostProcessors(PIIMaskingDocumentPostProcessor.builder())
+            .build();
+}
+```
+
+> Registrado como **default advisor** no `chatMemoryChatClient`, junto com memory, logger e auditoria de tokens. O `topK`/`similarityThreshold` que antes ficavam no `SearchRequest` agora vivem no `VectorStoreDocumentRetriever`.
+
+### 9.1 Ingestão de PDF — `TikaDocumentReader` + `TokenTextSplitter`
+
+A seção 8 ingeria frases soltas (`RandomDataLoader`, hoje com `@Component` comentado). O caso real carrega um **PDF** (`HRPolicyLoader`):
+
+```java
+@PostConstruct
+public void loadPDF() {
+    TikaDocumentReader tikaReader = new TikaDocumentReader(policyFile); // PDF/DOCX/HTML... -> texto
+    List<Document> documents = tikaReader.get();
+
+    TokenTextSplitter textSplitter = TokenTextSplitter.builder()
+            .withChunkSize(100)        // ~100 tokens por chunk
+            .withMaxNumChunks(500)
+            .build();
+
+    vectorStore.add(textSplitter.split(documents));   // quebra -> embeddings -> Qdrant
+}
+```
+
+- **`TikaDocumentReader`** (Apache Tika) extrai texto de PDF, DOCX, HTML, etc. → vira `Document`.
+- **`TokenTextSplitter`** quebra cada `Document` em **chunks por contagem de tokens** (não de caracteres).
+
+> 💡 **Por que o splitter reduz os tokens do prompt** (observação medida no estudo: ~1200 sem splitter vs ~500 com): sem splitter, o PDF inteiro vira poucos `Document`s gigantes, e o retriever traz blocos enormes (muito texto irrelevante) pro contexto. Com splitter, o índice tem chunks pequenos e coesos → o `topK` traz só os pedaços realmente relevantes à pergunta. Bônus: chunk pequeno gera um **embedding mais "focado"** (representa um assunto só), melhorando a precisão da busca.
+>
+> Trade-off: `chunkSize` pequeno demais fragmenta ideias (frase cortada perde sentido); grande demais volta a inflar tokens. `chunkOverlap` evita cortar exatamente na fronteira de uma ideia.
+
+### 9.2 Query Transformers — busca cross-lingual
+
+Problema: o PDF está em **inglês**, mas o usuário pergunta em **português**. A busca vetorial compara *vetores de significado*, e os embeddings da OpenAI são multilíngues — então PT já recupera chunks EN razoavelmente. Mas a similaridade cross-lingual é mais fraca que monolíngue.
+
+O **`TranslationQueryTransformer`** resolve traduzindo a query do usuário para o idioma do índice (inglês) **antes** da busca, deixando o retrieval monolíngue (mais preciso). Custo: uma chamada extra e barata ao LLM por pergunta.
+
+> Detalhe importante: o idioma da **query** afeta o *retrieval* (a busca); o idioma da **resposta** é controlado pelo *prompt*. São independentes — dá pra buscar em EN e responder em PT. Outro transformer útil é o `CompressionQueryTransformer`, que usa o histórico de memória pra condensar a conversa numa query autocontida.
+
+### 9.3 Retrieval da Web — `DocumentRetriever` customizado
+
+O `DocumentRetriever` não precisa ser um vector store. O `WebSearchDocumentRetriever` implementa a interface fazendo uma **busca web ao vivo** (API Tavily) e mapeando cada resultado num `Document`:
+
+```java
+public class WebSearchDocumentRetriever implements DocumentRetriever {
+    @Override
+    public List<Document> retrieve(Query query) {
+        // POST p/ Tavily com query.text() -> mapeia hits em Document (text + metadata url/title + score)
+    }
+}
+```
+
+Usado no `webSearchRAGChatClient` (`WebSearchRAGChatClientConfig`) através do mesmo `RetrievalAugmentationAdvisor` — só troca o `documentRetriever`. Exposto em `GET /api/rag/web-search/chat`.
+
+> Requer a env var `TAVILY_SEARCH_API_KEY`. Mostra a força da abstração: **a fonte de conhecimento é plugável** — vector store, web, banco, API — sem mudar o resto do pipeline.
+
+### 9.4 Post-Processors — mascaramento de PII
+
+O `DocumentPostProcessor` roda **depois** do retrieval e **antes** de injetar os docs no prompt. O `PIIMaskingDocumentPostProcessor` usa regex pra trocar e-mails e telefones por `[REDACTED_EMAIL]` / `[REDACTED_PHONE]`, evitando vazar dado sensível recuperado pro LLM:
+
+```java
+return documents.stream()
+        .map(document -> document.mutate()
+                .text(maskSensitiveInformation(document.getText()))
+                .metadata("pii_masked", true)
+                .build())
+        .toList();
+```
+
+> Outros usos de post-processor: re-ranking, deduplicação, truncamento, filtro por metadata.
+
+### Pontos de atenção (RAG modular)
+- **Controller limpo**: toda a lógica de RAG saiu do endpoint e virou configuração de advisor (compare com o bloco comentado em `RAGController`).
+- **Chamadas extras ao LLM**: cada `QueryTransformer` que usa LLM (tradução/compressão) é uma chamada a mais por pergunta — custo e latência.
+- **Memory + RAG competem por tokens**: o `MessageChatMemoryAdvisor` injeta histórico bruto (cego a relevância) no mesmo prompt do contexto RAG; refinar o RAG não reduz o peso da memória (ver seção 7 — janela menor ou resumo).
+
+---
+
+## 10. Semantic Cache (vector store / Qdrant)
+
+Cache comum (chave-valor) só acerta com a **mesma string exata**. "Qual a política de férias?" e "Como funcionam as férias?" seriam dois misses. O **Semantic Cache** acerta por **significado**: ele guarda o *embedding* da pergunta e, numa nova pergunta semanticamente parecida, devolve a resposta cacheada **sem chamar o LLM**.
+
+### Para que serve
+- **Economiza tokens/custo e latência**: hit = zero chamada ao modelo.
+- Ideal pra FAQ / perguntas recorrentes reformuladas de jeitos diferentes.
+
+### Backend plugável: Redis OU vector store
+O `DefaultSemanticCache` aceita **dois backends** pra guardar os pares (embedding da pergunta → resposta):
+- `.jedisClient(redisClient)` → guarda no **Redis** (precisa do serviço Redis no `compose.yml`).
+- `.vectorStore(vectorStore)` → guarda num **vector store** qualquer (aqui o **Qdrant**, que já usamos no RAG).
+
+Neste projeto **migramos de Redis para Qdrant** — faz sentido, já que o Qdrant já está de pé pro RAG e evita subir outra peça de infra só pro cache. Os beans de Redis ficaram comentados no `SemanticCacheConfig`.
+
+> Curiosidade: mesmo usando Qdrant, o `DefaultSemanticCache` vem do artefato `spring-ai-redis-semantic-cache` (`pom.xml`) — o nome é histórico; a classe suporta os dois backends.
+
+### Como é montado (`SemanticCacheConfig`)
+
+```java
+// 1. um vector store DEDICADO ao cache, em collection PRÓPRIA (separada da do RAG)
+@Bean("cacheVectorStore")
+VectorStore cacheVectorStore(QdrantClient qdrantClient, EmbeddingModel embeddingModel) {
+    return QdrantVectorStore.builder(qdrantClient, embeddingModel)
+            .collectionName("semantic-cache")   // != "teste" (a collection do RAG)
+            .initializeSchema(true)
+            .build();
+}
+
+// 2. o cache apontando pro vector store do cache
+@Bean
+SemanticCache semanticCache(@Qualifier("cacheVectorStore") VectorStore vectorStore,
+                            EmbeddingModel embeddingModel) {
+    return DefaultSemanticCache.builder()
+            .vectorStore(vectorStore)
+            .embeddingModel(embeddingModel)     // gera o embedding da pergunta
+            .similarityThreshold(0.8)           // só acerta se for parecida o bastante
+            .build();
+}
+
+@Bean
+public SemanticCacheAdvisor semanticCacheAdvisor(SemanticCache semanticCache) {
+    return SemanticCacheAdvisor.builder().cache(semanticCache).build();
+}
+```
+
+> ⚠️ **Collection separada é essencial.** O cache e o RAG **não podem dividir a mesma collection** — senão as perguntas+respostas do cache virariam "documentos" recuperáveis pelo RAG (e vice-versa), poluindo os dois. Por isso o `cacheVectorStore` usa `collectionName("semantic-cache")`, distinta da `teste` do RAG, e é injetado por `@Qualifier` pra não conflitar com o `VectorStore` principal.
+
+### O ciclo (é um advisor — seção 4)
+1. Chega a pergunta → o `SemanticCacheAdvisor` gera o embedding e busca na collection `semantic-cache` por uma pergunta anterior com similaridade **≥ 0.8**.
+2. **Hit** → devolve a resposta cacheada e **curto-circuita a cadeia** (o LLM nem é chamado).
+3. **Miss** → segue pro modelo normalmente e, no retorno, **grava** (embedding da pergunta → resposta) no vector store pra próxima vez.
+
+### Onde está registrado
+Como default advisor em dois clients:
+- `openChatClient` (`OpenChatClientConfig`): logger + auditoria de tokens + cache. Exposto em `GET /api/open-chat` (`OpenChatController`).
+- `chatMemoryChatClient` (`ChatMemoryChatClientConfig`): junto com memory e RAG.
+
+### Pontos de atenção
+- **`similarityThreshold` (0.8)** é o tuning crítico: baixo demais devolve resposta de uma pergunta *parecida mas diferente* (falso positivo); alto demais quase nunca acerta o cache. Mais permissivo que a versão Redis anterior (0.9).
+- **Confirmar o hit no `TokenUsageAuditAdvisor`**: num hit os tokens de completion caem a zero (não houve geração) — ótima forma de ver o cache agindo.
+- **Cache + Memory/RAG é delicado**: o cache curto-circuita antes do modelo, então uma resposta cacheada pode **ignorar o contexto da conversa atual** (memória) ou docs recém-recuperados. Faz mais sentido em perguntas "stateless" (como o `openChatClient`); combinar com memória pede cautela.
+- **Custo de embedding no miss/hit**: toda pergunta gera um embedding (chamada ao modelo de embedding) pra poder buscar no cache — barato perto de uma geração, mas não é zero.
+- **Invalidação**: respostas cacheadas não expiram sozinhas aqui — se a base/política muda, o cache pode servir resposta velha (TTL/invalidação ficariam a cargo do vector store/config).
+
+---
+
 ## Resumo geral (default vs. por requisição)
 
 | Conceito        | Global (no Builder)      | Pontual (no `prompt()`) |
@@ -562,3 +737,5 @@ Isso reduz **alucinação**: sem contexto relevante (busca não passou do thresh
 - **Structured Output** = resposta convertida direto em objeto Java (`.entity(...)` via `BeanOutputConverter`).
 - **Chat Memory** = histórico da conversa via `MessageChatMemoryAdvisor` + `ChatMemory`, isolado por `CONVERSATION_ID` (aqui o `username`); torna o LLM "com memória". Trocar o `ChatMemoryRepository` (in-memory → JDBC/H2 `file:`) faz o histórico **persistir entre reinícios**, sem mexer no código.
 - **RAG** = busca semântica (`vectorStore.similaritySearch`, `topK`/`threshold`) num **vector store** (Qdrant) + injeção dos trechos relevantes no system prompt; evolução do **Stuffing** que escala e reduz alucinação ("responda só pelos DOCUMENTS").
+- **RAG modular** = o mesmo RAG feito pelo `RetrievalAugmentationAdvisor` (controller fica limpo), com pipeline plugável: `QueryTransformer` (pré — ex. `TranslationQueryTransformer` p/ cross-lingual) → `DocumentRetriever` (vector store **ou** web/Tavily) → `DocumentPostProcessor` (pós — ex. PII masking). Ingestão de PDF via `TikaDocumentReader` + `TokenTextSplitter` (chunks por token reduzem os tokens do prompt).
+- **Semantic Cache** = cache por **significado** (`SemanticCacheAdvisor` + embedding + `similarityThreshold`); hit devolve a resposta sem chamar o LLM (economiza tokens/latência), miss grava p/ a próxima. Backend plugável (Redis **ou** vector store) — aqui no **Qdrant**, em collection **separada** (`semantic-cache`) da do RAG.

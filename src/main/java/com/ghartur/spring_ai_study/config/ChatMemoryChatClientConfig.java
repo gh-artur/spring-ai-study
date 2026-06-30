@@ -1,11 +1,18 @@
 package com.ghartur.spring_ai_study.config;
 
+import com.ghartur.spring_ai_study.advisors.TokenUsageAuditAdvisor;
+import com.ghartur.spring_ai_study.rag.PIIMaskingDocumentPostProcessor;
+import org.springframework.ai.chat.cache.semantic.SemanticCacheAdvisor;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.memory.MessageWindowChatMemory;
 import org.springframework.ai.chat.memory.repository.jdbc.JdbcChatMemoryRepository;
+import org.springframework.ai.rag.advisor.RetrievalAugmentationAdvisor;
+import org.springframework.ai.rag.preretrieval.query.transformation.TranslationQueryTransformer;
+import org.springframework.ai.rag.retrieval.search.VectorStoreDocumentRetriever;
+import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -23,13 +30,34 @@ public class ChatMemoryChatClientConfig {
     }
 
     @Bean(name = "chatMemoryChatClient")
-    public ChatClient chatClient(ChatClient.Builder chatClientBuilder, ChatMemory chatMemory) {
+    public ChatClient chatClient(ChatClient.Builder chatClientBuilder,
+                                 ChatMemory chatMemory,
+                                 RetrievalAugmentationAdvisor retrievalAugmentationAdvisor,
+                                 SemanticCacheAdvisor semanticCacheAdvisor) {
 
         SimpleLoggerAdvisor loggerAdvisor = SimpleLoggerAdvisor.builder().build();
+        TokenUsageAuditAdvisor tokenAdvisor = new TokenUsageAuditAdvisor();
         MessageChatMemoryAdvisor memoryAdvisor = MessageChatMemoryAdvisor.builder(chatMemory).build();
 
         return chatClientBuilder
-                .defaultAdvisors(List.of(loggerAdvisor, memoryAdvisor))
+                .defaultAdvisors(List.of(loggerAdvisor, memoryAdvisor, tokenAdvisor, retrievalAugmentationAdvisor, semanticCacheAdvisor))
+                .build();
+    }
+
+    @Bean
+    RetrievalAugmentationAdvisor retrievalAugmentationAdvisor(VectorStore vectorStore,
+                                                              ChatClient.Builder chatClientBuilder) {
+        return RetrievalAugmentationAdvisor.builder()
+                .queryTransformers(TranslationQueryTransformer.builder()
+                        .chatClientBuilder(chatClientBuilder.clone())
+                        .targetLanguage("english")
+                        .build())
+                .documentRetriever(VectorStoreDocumentRetriever.builder()
+                        .vectorStore(vectorStore)
+                        .topK(3)
+                        .similarityThreshold(0.5)
+                        .build())
+                .documentPostProcessors(PIIMaskingDocumentPostProcessor.builder())
                 .build();
     }
 }
