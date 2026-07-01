@@ -186,6 +186,16 @@ usar. Ciclo: mando prompt + tools -> modelo responde "quero chamar getCurrentTim
 resultado -> modelo gera o texto final. Ou seja, são DUAS idas ao modelo por trás de um único call. Exemplo aqui: tool que
 retorna a hora atual num fuso horário.
 
+-------------
+
+Tool Calling com banco + ToolContext (help desk): Evolui a tool "só leitura" pra tools que fazem operação REAL no banco
+(criar/consultar tickets via JPA). Aprendizado principal: tem dois tipos de "entrada" numa tool. (1) Argumentos @ToolParam
+(ex: o issue do ticket) -> vão no schema e QUEM PREENCHE é o modelo, a partir da conversa. (2) ToolContext (ex: o username)
+-> preenchido pela MINHA app no controller (.toolContext(Map.of("username", user))) e o modelo NEM VÊ. Uso o ToolContext
+pra identidade/segurança: o LLM não escolhe de quem é o ticket, quem manda isso sou eu. Outro detalhe: @Tool(returnDirect
+= true) faz o retorno da tool virar a resposta final direto, sem a 2ª ida ao modelo (economiza uma geração quando o
+resultado já é a resposta pronta, tipo "Ticket #12 criado").
+
 
 
 

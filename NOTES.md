@@ -794,6 +794,50 @@ Com o RAG desligado seguem funcionando `/api/chat`, `/api/stream`, structured ou
 
 ---
 
+## 13. Tool Calling com banco de dados + `ToolContext` (help desk)
+
+Exemplo mais completo de tool calling: um assistente de **help desk** cujas tools **operam no banco** (criam e consultam tickets via JPA). Sobe o degrau de "tool que só lê a hora" (seção 11) para "tool que executa efeito colateral real na aplicação".
+
+### As peças
+- **Tools** (`HelpDeskTools`): `createTicket` e `getTicketStatus`, anotadas com `@Tool`, injetam o `HelpDeskTicketService`.
+- **Persistência**: `HelpDeskTicket` (`@Entity`) + `HelpDeskTicketRepository` (`JpaRepository`) + `HelpDeskTicketService`. Banco H2 (mesmo do chat memory), tabela criada via `spring.jpa.hibernate.ddl-auto=update`.
+- **Client**: `helpDeskChatClient` (`HelpDeskChatClientConfig`) com system prompt próprio (`helpDeskSystemPromptTemplate.st`) + memória + as `TimeTools`.
+- **Endpoint**: `GET /api/tools/help-desk` (`HelpDeskController`).
+
+### `ToolContext` — dado que o modelo **não** vê
+O ponto-chave desse exemplo. O `username` **não** entra no schema da tool nem no prompt: ele é injetado no `ToolContext` pelo controller e lido dentro da tool.
+
+```java
+// Controller — injeta dado fora do alcance do modelo
+chatClient.prompt()
+    .user(message)
+    .tools(helpDeskTools)
+    .toolContext(Map.of("username", username))
+    .call().content();
+
+// Tool — recebe o ToolContext como parâmetro extra
+@Tool(name = "createTicket", description = "Create the Support Ticket", returnDirect = true)
+String createTicket(@ToolParam(description = "Details to create a Support ticket") TicketRequest ticketRequest,
+                    ToolContext toolContext) {
+    String username = (String) toolContext.getContext().get("username");
+    ...
+}
+```
+
+Contraste com o que **vai** no schema: o `TicketRequest` (o campo `issue`) é `@ToolParam`, então **é o modelo quem preenche** a partir da conversa. Ou seja:
+- **Argumentos `@ToolParam`** = preenchidos pelo LLM (entram no JSON Schema enviado à OpenAI).
+- **`ToolContext`** = preenchido pela aplicação, **invisível ao modelo** — ele não vê nem consegue forjar. Ideal para identidade/tenant/permissões (segurança: o LLM não escolhe o `username` do dono do ticket).
+
+### `returnDirect`
+`createTicket` usa `@Tool(returnDirect = true)`: o retorno da tool vira **a resposta final**, sem uma segunda ida ao modelo. Contraria o round-trip normal (seção 11, passo 4) — útil quando o resultado da tool já é a resposta pronta (ex.: "Ticket #12 criado") e não vale gastar mais uma geração. `getTicketStatus` não usa, então a lista de tickets volta pro modelo redigir a resposta.
+
+### Pontos de atenção
+- **Efeito colateral real**: diferente de uma tool "read-only", `createTicket` grava no banco. Description precisa ser clara pro modelo chamar na hora certa (e não criar ticket à toa).
+- **Objeto como parâmetro**: um `record` (`TicketRequest`) vira um objeto no JSON Schema — o modelo monta o objeto a partir da conversa.
+- **Tools registradas em dois níveis**: as `TimeTools` são default no client (`defaultTools`), e as `HelpDeskTools` são passadas por requisição (`.tools(...)`) — dá pra combinar tools globais e pontuais.
+
+---
+
 ## Resumo geral (default vs. por requisição)
 
 | Conceito        | Global (no Builder)      | Pontual (no `prompt()`) |
@@ -815,3 +859,4 @@ Com o RAG desligado seguem funcionando `/api/chat`, `/api/stream`, structured ou
 - **Semantic Cache** = cache por **significado** (`SemanticCacheAdvisor` + embedding + `similarityThreshold`); hit devolve a resposta sem chamar o LLM (economiza tokens/latência), miss grava p/ a próxima. Backend plugável (Redis **ou** vector store) — aqui no **Qdrant**, em collection **separada** (`semantic-cache`) da do RAG.
 - **Tool Calling** = o LLM pede pra executar um método `@Tool` seu (ex. `TimeTools`), decidindo nome + argumentos; a app roda e devolve o resultado pro modelo finalizar. As tools vão num **campo separado** da requisição (array `tools` = nome + description + JSON Schema), **não** no texto do prompt; são **duas** idas ao modelo por chamada.
 - **Toggle de RAG** = tudo que é RAG (Qdrant, docker-compose, ingestão, clients que dependem de `VectorStore`/cache) fica atrás do profile `rag`, **off por padrão** pra boot rápido; liga com `-Dspring-boot.run.profiles=rag`.
+- **Tool Calling + DB / `ToolContext`** = tools que operam no banco (help desk: `createTicket`/`getTicketStatus` via JPA). Argumentos `@ToolParam` (ex. `TicketRequest`) são preenchidos pelo **LLM** (vão no schema); o `ToolContext` (ex. `username`) é preenchido pela **app** e **invisível ao modelo** (bom pra identidade/segurança). `@Tool(returnDirect=true)` faz o retorno da tool ser a resposta final (sem 2ª ida ao modelo).
