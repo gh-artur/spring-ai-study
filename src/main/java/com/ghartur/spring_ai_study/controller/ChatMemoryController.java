@@ -3,10 +3,12 @@ package com.ghartur.spring_ai_study.controller;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Profile;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
 @RequestMapping("/api")
+@Profile("rag")
 public class ChatMemoryController {
 
     private final ChatClient chatClient;

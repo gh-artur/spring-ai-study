@@ -176,6 +176,16 @@ Onde guardar o cache: pode ser no Redis OU no próprio vector database. Troquei 
 RAG), assim não preciso subir outra infra só pro cache. IMPORTANTE: o cache tem que ficar numa collection SEPARADA da do
 RAG, senão as perguntas/respostas do cache viram "documento" que o RAG recupera, bagunçando os dois.
 
+-------------
+
+Tool Calling (function calling): Deixa o LLM PEDIR pra rodar um código meu no meio da resposta. O modelo não executa nada,
+ele só decide QUAL função chamar e com QUAIS argumentos; quem roda é a minha aplicação, que devolve o resultado pro modelo
+continuar. Ponto que me confundiu: as tools NÃO vão no texto do prompt — vão num campo SEPARADO da requisição (o array
+"tools"), cada uma com nome + descrição + schema dos parâmetros. É a DESCRIÇÃO da tool que o modelo lê pra decidir quando
+usar. Ciclo: mando prompt + tools -> modelo responde "quero chamar getCurrentTime(Tóquio)" -> app executa e devolve o
+resultado -> modelo gera o texto final. Ou seja, são DUAS idas ao modelo por trás de um único call. Exemplo aqui: tool que
+retorna a hora atual num fuso horário.
+
 
 
 

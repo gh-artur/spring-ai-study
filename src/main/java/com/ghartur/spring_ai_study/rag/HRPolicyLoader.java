@@ -6,12 +6,14 @@ import org.springframework.ai.reader.tika.TikaDocumentReader;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Profile;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
 
 @Component
+@Profile("rag")
 public class HRPolicyLoader {
 
     private final VectorStore vectorStore;

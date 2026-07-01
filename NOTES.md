@@ -466,6 +466,8 @@ spring.ai.vectorstore.qdrant.collection-name=teste
 ```
 
 > O Spring Boot, com a dependência `spring-boot-docker-compose`, **sobe o `compose.yml` sozinho** no startup. O `VectorStore` é auto-configurado a partir dessas properties.
+>
+> ⚠️ **Isso hoje só acontece com o profile `rag` ativo** (ver seção 12). Por padrão o RAG fica desligado: `spring.docker.compose.enabled=false` e `initialize-schema=false`, pra o boot ser rápido quando não estou mexendo em RAG.
 
 ### Fase 1 — Ingestão (`@PostConstruct`)
 Cada `String` vira um `Document`; o `vectorStore.add(...)` gera os embeddings (chamando o modelo de embedding do OpenAI) e grava no Qdrant:
@@ -720,6 +722,78 @@ Como default advisor em dois clients:
 
 ---
 
+## 11. Tool Calling (function calling)
+
+Tool calling deixa o LLM **pedir para executar código seu** durante a geração. O modelo não roda nada — ele só decide *qual* função chamar e com *quais* argumentos; quem executa é a aplicação, que devolve o resultado pro modelo continuar a resposta.
+
+### Como é montado neste projeto
+Métodos Java anotados com `@Tool` num bean (`TimeTools`), registrados como default no `timeChatClient`:
+
+```java
+@Component
+public class TimeTools {
+    @Tool(name = "getCurrentLocalTime", description = "Get the current time in the user's timezone")
+    String getCurrentLocalTime() { ... }
+
+    @Tool(name = "getCurrentTime", description = "Get the current time in the specified time zone.")
+    public String getCurrentTime(@ToolParam(description = "Value representing the time zone") String timeZone) { ... }
+}
+```
+
+```java
+// TimeChatClientConfig
+chatClientBuilder.defaultTools(timeTools).defaultAdvisors(...).build();
+```
+
+Exposto em `GET /api/tools/local-time` (`TimeController`).
+
+### Como o modelo "sabe" das tools — **não** é no prompt
+Ponto que confunde: as tools **não** entram no texto do system/user prompt. O Spring AI usa reflection sobre os `@Tool` e monta, pra cada uma, um `ToolDefinition` (**nome + description + JSON Schema dos parâmetros**) que vai num **campo separado** da requisição HTTP — o array `tools` do endpoint *Chat Completions* da OpenAI. A `description` da anotação é literalmente o que o modelo lê pra decidir quando usar a tool.
+
+```json
+"tools": [
+  { "type": "function", "function": {
+      "name": "getCurrentTime",
+      "description": "Get the current time in the specified time zone.",
+      "parameters": { "type": "object",
+        "properties": { "timeZone": { "type": "string", "description": "Value representing the time zone" } },
+        "required": ["timeZone"] } } }
+]
+```
+
+### O round-trip (dentro de um único `.call()`)
+1. Requisição vai com o prompt **+** o array `tools`.
+2. Modelo responde `finish_reason: "tool_calls"` com `{name, arguments}` (ainda **não** é texto).
+3. Spring AI casa o nome com o método Java, executa (dá pra ver o `LOGGER.info` da tool disparar) e devolve o retorno numa mensagem de role `tool`.
+4. Segunda chamada ao modelo com o resultado → aí vem o texto final.
+
+### Como observar o array `tools` na prática
+O `SimpleLoggerAdvisor` loga no nível do `ChatClient` e **não** mostra bem as tools (são adicionadas na camada HTTP). Pra ver o payload cru, um `RestClientCustomizer` com `requestInterceptor` logando o corpo da requisição mostra o JSON indo pra `api.openai.com`, com o array `tools` dentro.
+
+### Pontos de atenção
+- **Description é tudo**: description ruim = o modelo não sabe quando chamar a tool ou passa argumento errado. `@ToolParam(description=...)` documenta cada parâmetro no schema.
+- **Duas chamadas ao modelo** por tool call (antes e depois de executar) = mais tokens/latência que um chat simples.
+
+---
+
+## 12. Ligar/desligar o RAG (Spring Profile `rag`)
+
+O RAG (Qdrant + docker-compose + ingestão de PDF) deixava o startup lento e exigia o Qdrant no ar. Como os beans de RAG estão **entrelaçados** em vários `ChatClient` (o `chatMemoryChatClient` e o `openChatClient` dependem do `semanticCacheAdvisor`/`VectorStore`), não dava pra desligar só o loader — o boot quebrava sem Qdrant. Solução: agrupar tudo que é RAG atrás do profile `rag`, **desligado por padrão**.
+
+- `@Profile("rag")` em: `SemanticCacheConfig`, `ChatMemoryChatClientConfig`, `OpenChatClientConfig`, `WebSearchRAGChatClientConfig`, `HRPolicyLoader`, `RAGController`, `OpenChatController`, `ChatMemoryController`.
+- O bean `chatMemory` foi extraído para `ChatMemoryConfig` (**sempre ativo**), porque o `timeChatClient` (tool calling) usa memória sem precisar de RAG.
+- `application.properties` (padrão): `spring.docker.compose.enabled=false` e `qdrant.initialize-schema=false` → não sobe Docker nem conecta no Qdrant.
+- `application-rag.properties`: religa `docker.compose.enabled=true` e `initialize-schema=true`.
+
+| Modo | Comando |
+|------|---------|
+| RAG **ligado** | `./mvnw spring-boot:run -Dspring-boot.run.profiles=rag` |
+| RAG **desligado** (padrão) | `./mvnw spring-boot:run` |
+
+Com o RAG desligado seguem funcionando `/api/chat`, `/api/stream`, structured output, prompt template/stuffing e `/api/tools/local-time`. Ficam desabilitados `/api/rag/**`, `/api/open-chat` e `/api/chat-memory`. Bônus: o teste `contextLoads` sobe sem precisar do Qdrant.
+
+---
+
 ## Resumo geral (default vs. por requisição)
 
 | Conceito        | Global (no Builder)      | Pontual (no `prompt()`) |
@@ -739,3 +813,5 @@ Como default advisor em dois clients:
 - **RAG** = busca semântica (`vectorStore.similaritySearch`, `topK`/`threshold`) num **vector store** (Qdrant) + injeção dos trechos relevantes no system prompt; evolução do **Stuffing** que escala e reduz alucinação ("responda só pelos DOCUMENTS").
 - **RAG modular** = o mesmo RAG feito pelo `RetrievalAugmentationAdvisor` (controller fica limpo), com pipeline plugável: `QueryTransformer` (pré — ex. `TranslationQueryTransformer` p/ cross-lingual) → `DocumentRetriever` (vector store **ou** web/Tavily) → `DocumentPostProcessor` (pós — ex. PII masking). Ingestão de PDF via `TikaDocumentReader` + `TokenTextSplitter` (chunks por token reduzem os tokens do prompt).
 - **Semantic Cache** = cache por **significado** (`SemanticCacheAdvisor` + embedding + `similarityThreshold`); hit devolve a resposta sem chamar o LLM (economiza tokens/latência), miss grava p/ a próxima. Backend plugável (Redis **ou** vector store) — aqui no **Qdrant**, em collection **separada** (`semantic-cache`) da do RAG.
+- **Tool Calling** = o LLM pede pra executar um método `@Tool` seu (ex. `TimeTools`), decidindo nome + argumentos; a app roda e devolve o resultado pro modelo finalizar. As tools vão num **campo separado** da requisição (array `tools` = nome + description + JSON Schema), **não** no texto do prompt; são **duas** idas ao modelo por chamada.
+- **Toggle de RAG** = tudo que é RAG (Qdrant, docker-compose, ingestão, clients que dependem de `VectorStore`/cache) fica atrás do profile `rag`, **off por padrão** pra boot rápido; liga com `-Dspring-boot.run.profiles=rag`.

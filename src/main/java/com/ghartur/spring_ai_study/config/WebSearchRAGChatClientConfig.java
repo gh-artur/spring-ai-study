@@ -9,11 +9,13 @@ import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.rag.advisor.RetrievalAugmentationAdvisor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
 import org.springframework.web.client.RestClient;
 
 import java.util.List;
 
 @Configuration
+@Profile("rag")
 public class WebSearchRAGChatClientConfig {
 
     @Bean(name = "webSearchRAGChatClient")
