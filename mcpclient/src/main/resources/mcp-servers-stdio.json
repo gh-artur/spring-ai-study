@@ -1,0 +1,35 @@
+{
+  "mcpServers": {
+    "spring-ai-mcp": {
+      "command": "C:\\Users\\Artur\\AppData\\Local\\mise\\shims\\java.exe",
+      "args": [
+        "-jar",
+        "C:\\git\\spring-ai-study\\spring-ai-study\\mcpserverstdio\\target\\mcpserverstdio-0.0.1-SNAPSHOT.jar"
+      ]
+    },
+    "filesystem": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "C:\\Users\\Artur\\mcp"
+      ]
+    },
+    "github": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-e",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "ghcr.io/github/github-mcp-server"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "REPLACE_WITH_YOUR_GITHUB_PAT"
+      }
+    }
+  }
+}
