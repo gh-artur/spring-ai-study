@@ -16,13 +16,20 @@ only the shared study notes and repo-wide config, not source code.
 ├── NOTES.md            <- running study notes (per Spring AI / MCP topic)
 ├── CONCEITOS.md        <- concept summaries
 ├── mise.toml           <- repo-wide toolchain (Java 25)
-└── spring-ai-playground/   <- subproject: Spring AI feature playground (OpenAI chat)
-    └── (future MCP subprojects will be added as sibling folders, e.g. mcp-xxx/)
+├── spring-ai-playground/   <- subproject: Spring AI feature playground (OpenAI chat)
+├── mcpclient/              <- subproject: MCP client/host — consumes MCP servers as tools
+├── mcpserverstdio/         <- subproject: MCP server over stdio (local help-desk tools)
+└── mcpserverremote/        <- subproject: MCP server over streamable HTTP (:8090)
 ```
 
 Each subproject is independent: there is **no parent/aggregator POM**. Build and run
 commands are always run from inside the subproject directory. New MCPs are added as new
 top-level folders and may use any stack.
+
+To add a new subproject (e.g. a fresh Spring Initializr project), follow
+`docs/ADICIONAR_SUBPROJETO.md` and run `scripts/novo-subprojeto.sh <folder>` to strip the
+redundant per-project `.gitignore`/`.gitattributes` and flag absolute paths / missing
+Lombok config.
 
 ## Commands
 
@@ -56,3 +63,31 @@ directory, so run commands from the subproject root.
 
 - Package name is `com.ghartur.spring_ai_study` (underscores) because the original
   hyphenated name was invalid — see `spring-ai-playground/HELP.md`.
+
+## Subprojects: MCP (client + servers)
+
+Three subprojects exploring the **Model Context Protocol** (see `NOTES.md` §14 and the MCP
+section of `CONCEITOS.md`). The two servers expose the **same help-desk tools**
+(`@McpTool` `createTicket`/`getTicketStatus`, JPA + H2); only the transport differs.
+
+- `mcpclient` — the **host**. Discovers MCP servers declared in
+  `src/main/resources/mcp-servers.json` and exposes their tools to the LLM via a
+  `ToolCallbackProvider` (`.defaultTools(...)`). Endpoint `GET /api/chat`.
+- `mcpserverstdio` — MCP server over **stdio** (`web-application-type=none`); the client
+  launches it as a subprocess (`java -jar`).
+- `mcpserverremote` — MCP server over **streamable HTTP** (`spring.ai.mcp.server.protocol=
+  streamable`, port **8090**); clients connect by URL.
+
+Gotchas (all hit during the study, documented in `NOTES.md` §14.4):
+
+- **stdio = one server process per client.** Don't run the MCP Inspector and the client at
+  the same time — both spawn their own server instance and collide on the H2 `./chatmemory`
+  file, so the second stalls and the client times out on the 20s init handshake.
+- **Windows jar lock:** a leftover server instance holds the jar, breaking `mvn clean`/
+  `repackage` (`Unable to rename ... .jar.original`). Kill it first (a `killjava <substr>`
+  bash function was added to the user's `~/.bashrc`).
+- `mvnw` obeys `JAVA_HOME`, not the `java` on `PATH` — a stale `JAVA_HOME` on JDK 17 gives
+  `release version 25 not supported` even when `java -version` shows 25. `mise activate` in
+  the shell profile keeps `JAVA_HOME` aligned with `mise.toml`.
+- MCP servers that persist need `spring.jpa.hibernate.ddl-auto=update`, else the file-based
+  H2 starts empty and inserts fail with `Table "HELPDESK_TICKETS" not found`.

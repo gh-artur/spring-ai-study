@@ -838,6 +838,86 @@ Contraste com o que **vai** no schema: o `TicketRequest` (o campo `issue`) é `@
 
 ---
 
+## 14. MCP (Model Context Protocol)
+
+MCP é um **protocolo aberto** que padroniza como uma aplicação dá ao LLM acesso a **tools, dados e contexto externos**. É o passo além do **Tool Calling** (seções 11 e 13): lá as `@Tool` viviam **dentro** da app; com MCP as capacidades ficam num **servidor separado**, publicadas uma vez e consumidas por qualquer host/LLM — sem reimplementar em cada app.
+
+### Arquitetura — Host, Client, Server
+
+| Papel | O que é | Neste estudo |
+|-------|---------|--------------|
+| **Host** | A aplicação que roda o LLM e quer usar capacidades externas | `mcpclient` (app Spring AI + OpenAI) |
+| **Client** | O conector **dentro** do host; **1 client = 1 conexão com 1 server** (um host pode ter vários) | auto-configurado pelo `spring-ai-starter-mcp-client` |
+| **Server** | Expõe as capacidades (aqui, **tools**) via o protocolo | `mcpserverstdio` e `mcpserverremote` |
+
+### Os dois transports
+
+Como client e server trocam mensagens (sempre **JSON-RPC**), por baixo:
+
+| Transport | Onde roda o server | Como conversa | Quando |
+|-----------|--------------------|---------------|--------|
+| **stdio** | processo **local**, **subido pelo próprio client** (`command` + `args`) | JSON-RPC por **stdin/stdout** | server local, mesma máquina |
+| **streamable http** | serviço **web** já no ar (local ou remoto), numa porta | JSON-RPC sobre **HTTP** (com streaming) | server externo/compartilhado |
+
+> ⚠️ No **stdio**, o **stdout é o canal do protocolo** — o server **não pode logar/printar no stdout**, senão corrompe o JSON-RPC. Daí `banner-mode=off` e log em arquivo/stderr.
+
+### 14.1 O Client (`mcpclient`)
+
+Deps: `spring-ai-starter-mcp-client` + `spring-ai-starter-model-openai` (+ webmvc pro endpoint REST). Os servers são declarados num JSON no **formato do Claude Desktop**:
+
+```json
+// mcp-servers.json
+{ "mcpServers": {
+    "spring-ai-mcp": { "command": "java.exe", "args": ["-jar", ".../mcpserverstdio-0.0.1-SNAPSHOT.jar"] },
+    "filesystem":    { "command": "cmd", "args": ["/c","npx","-y","@modelcontextprotocol/server-filesystem","C:\\Users\\Artur\\mcp"] },
+    "github":        { "command": "docker", "args": ["run","-i","--rm", "..."], "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "..." } }
+} }
+```
+
+```properties
+spring.ai.mcp.client.stdio.servers-configuration=classpath:mcp-servers.json
+spring.ai.mcp.client.request-timeout=60s   # cold start do npx passava dos 20s default
+```
+
+No boot, o Spring AI **sobe cada server** (stdio → subprocesso), faz o **handshake**, **descobre as tools** e entrega tudo num `ToolCallbackProvider`. O controller registra esse provider como tools default:
+
+```java
+public MCPClientController(ChatClient.Builder builder, ToolCallbackProvider toolCallbackProvider) {
+    this.chatClient = builder
+            .defaultTools(toolCallbackProvider)   // as tools MCP viram tools normais
+            .defaultAdvisors(new SimpleLoggerAdvisor())
+            .build();
+}
+```
+
+> **Ligação com a seção 11:** as tools MCP entram no **mesmo array `tools`** da requisição à OpenAI. Pro LLM é indistinguível de uma `@Tool` local — ele nem sabe que veio de um server MCP. MCP muda **de onde vem** a tool, não como o modelo a usa.
+
+### 14.2 Server via stdio (`mcpserverstdio`)
+
+- Deps: `spring-ai-starter-mcp-server-webmvc`, mas `spring.main.web-application-type=none` → roda como **processo stdio puro** (sem porta web).
+- Tools anotadas com **`@McpTool` / `@McpToolParam`** (`org.springframework.ai.mcp.annotation`) — o equivalente MCP do `@Tool`/`@ToolParam` local. Aqui é o mesmo **help desk** da seção 13 (`createTicket`/`getTicketStatus`), persistindo em H2 via JPA.
+- O client o inicia via `command: java.exe, args: [-jar, ...jar]` (ver `mcp-servers.json`).
+
+### 14.3 Server via streamable HTTP (`mcpserverremote`)
+
+**As mesmas tools**, trocando só o transport:
+
+```properties
+spring.ai.mcp.server.protocol=streamable
+server.port=8090
+```
+
+Diferença central pro stdio: sobe **uma vez** como web service e **vários clients** conectam por **URL** — **não** há "um processo por client". É o modelo pra um MCP **compartilhado/remoto**.
+
+### 14.4 Pontos de atenção (troubleshooting vivido no estudo)
+
+- **stdio = 1 processo por client.** Cada client dá o seu `java -jar` e cria a **sua** instância do server. Rodar o **MCP Inspector** e o **app** ao mesmo tempo = duas instâncias do mesmo server → colidem no arquivo H2 `./chatmemory`; a segunda emperra o boot → o client não recebe o `initialize` e estoura o **timeout de inicialização (20s)**: `Did not observe any item ... within 20000ms in 'map'`. **Regra: um dono do server por vez.** (`request-timeout` é outro timeout — não cobre esse.)
+- **Windows trava o jar.** Instância sobrando **segura o arquivo** → `mvn clean`/`repackage` falham (`Unable to rename ... .jar.original` / *"arquivo já está sendo usado"*). No Linux/Mac não daria — é peculiaridade do Windows. Matar o processo resolve (função `killjava <trecho>` no bash).
+- **`mvnw` usa o `JAVA_HOME`, não o `java` do PATH.** Dava `release version 25 not supported` **mesmo com `java -version` = 25**, porque o `JAVA_HOME` apontava pro JDK 17. `mise activate` no profile do shell mantém o `JAVA_HOME` alinhado ao `mise.toml`.
+- **`@McpTool` que grava no banco precisa da tabela.** Sem `spring.jpa.hibernate.ddl-auto=update`, o H2 **file** sobe vazio → o insert quebra com `Table "HELPDESK_TICKETS" not found` (o `create-drop` automático só vale pra H2 **em memória**).
+
+---
+
 ## Resumo geral (default vs. por requisição)
 
 | Conceito        | Global (no Builder)      | Pontual (no `prompt()`) |
@@ -860,3 +940,4 @@ Contraste com o que **vai** no schema: o `TicketRequest` (o campo `issue`) é `@
 - **Tool Calling** = o LLM pede pra executar um método `@Tool` seu (ex. `TimeTools`), decidindo nome + argumentos; a app roda e devolve o resultado pro modelo finalizar. As tools vão num **campo separado** da requisição (array `tools` = nome + description + JSON Schema), **não** no texto do prompt; são **duas** idas ao modelo por chamada.
 - **Toggle de RAG** = tudo que é RAG (Qdrant, docker-compose, ingestão, clients que dependem de `VectorStore`/cache) fica atrás do profile `rag`, **off por padrão** pra boot rápido; liga com `-Dspring-boot.run.profiles=rag`.
 - **Tool Calling + DB / `ToolContext`** = tools que operam no banco (help desk: `createTicket`/`getTicketStatus` via JPA). Argumentos `@ToolParam` (ex. `TicketRequest`) são preenchidos pelo **LLM** (vão no schema); o `ToolContext` (ex. `username`) é preenchido pela **app** e **invisível ao modelo** (bom pra identidade/segurança). `@Tool(returnDirect=true)` faz o retorno da tool ser a resposta final (sem 2ª ida ao modelo).
+- **MCP (Model Context Protocol)** = tool calling com as capacidades **num server separado**, não dentro da app. Papéis **Host** (a app/LLM) → **Client** (conector, 1:1 com um server) → **Server** (expõe as tools). Dois transports: **stdio** (server local subido **pelo próprio client** como processo, JSON-RPC por stdin/stdout — 1 processo por client) e **streamable HTTP** (server web numa porta, vários clients por URL). No client (`mcpclient`), o Spring AI descobre as tools do server e as entrega num `ToolCallbackProvider` → `.defaultTools(...)`, e elas viram tools **normais** no array `tools` (o LLM não sabe que vieram de MCP). Servers de estudo: `mcpserverstdio` (stdio, `@McpTool` + `web-application-type=none`) e `mcpserverremote` (streamable, `:8090`).

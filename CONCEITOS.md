@@ -196,6 +196,50 @@ pra identidade/segurança: o LLM não escolhe de quem é o ticket, quem manda is
 = true) faz o retorno da tool virar a resposta final direto, sem a 2ª ida ao modelo (economiza uma geração quando o
 resultado já é a resposta pronta, tipo "Ticket #12 criado").
 
+-------------
+
+MCP (Model Context Protocol): protocolo aberto pra padronizar como uma aplicação dá ao LLM acesso a tools/dados
+externos. Três papéis: HOST (a app que roda o LLM), CLIENT (o conector dentro do host — 1 client = 1 conexão com
+1 server) e SERVER (quem expõe as capacidades; aqui, tools). A sacada é desacoplar: o server publica as tools uma
+vez e qualquer host/LLM consome, sem reimplementar em cada app.
+
+Transport types (como client e server conversam):
+- stdio: o client SOBE o server como um processo local (command + args) e conversa por JSON-RPC no stdin/stdout.
+  Pra server local, mesma máquina. IMPORTANTE: o stdout é o canal do protocolo -> o server não pode logar/printar
+  no stdout senão corrompe o JSON-RPC (banner off, log em arquivo/stderr).
+- streamable http: o server já roda como serviço web (local ou remoto) numa porta e o client conecta por URL
+  (JSON-RPC sobre HTTP, com streaming). Pra server externo/compartilhado.
+
+O que montei no estudo (mesma HelpDeskTools da seção de tool calling nos dois servers):
+- mcpclient: o HOST. Deps spring-ai-starter-mcp-client + model-openai. Declaro os servers no mcp-servers.json
+  (formato do Claude Desktop: mcpServers { nome: { command, args, env } }). O Spring AI sobe cada server, faz o
+  handshake, descobre as tools e me entrega um ToolCallbackProvider. No controller faço
+  .defaultTools(toolCallbackProvider) -> as tools MCP viram tools NORMAIS de tool calling: pro LLM é só mais uma
+  entrada no array "tools", ele nem sabe que veio de MCP. Botei request-timeout=60s porque o cold start do npx
+  (server filesystem) passava dos 20s default.
+- mcpserverstdio: server via STDIO. spring-ai-starter-mcp-server-webmvc + web-application-type=none (roda sem
+  porta, puro stdio). Tools com @McpTool/@McpToolParam (equivalente ao @Tool local, mas expõe via MCP).
+- mcpserverremote: MESMAS tools, mas streamable http -> spring.ai.mcp.server.protocol=streamable + server.port=8090.
+  Diferença central: roda UMA vez como web service e vários clients conectam por URL; não é "um processo por client".
+
+-------------
+
+MCP na prática — o que me quebrou (e o porquê):
+- stdio é UM PROCESSO POR CLIENT. Cada client dá o seu "java -jar" e cria a SUA instância do server. Deixar o MCP
+  Inspector aberto E subir o app ao mesmo tempo = duas instâncias do mesmo server -> colidem no arquivo H2
+  ./chatmemory; a segunda emperra no boot -> o client não recebe o "initialize" e estoura o timeout de
+  inicialização de 20s ("Did not observe any item ... within 20000ms in 'map'"). Regra: um dono do server por vez.
+- Windows trava o jar. Instância sobrando segura o arquivo -> "mvn clean/repackage" falha ("Unable to rename" /
+  "arquivo já está sendo usado"). Matar o java resolve (criei a função killjava <trecho> no bash).
+- mvnw usa o JAVA_HOME, NÃO o java do PATH. Dava "release version 25 not supported" mesmo com java -version = 25,
+  porque o JAVA_HOME apontava pro JDK 17. Botei "mise activate" no profile do PowerShell pra manter alinhado.
+- @McpTool que grava no banco precisa da tabela: sem spring.jpa.hibernate.ddl-auto=update o H2 file sobe vazio e o
+  insert quebra com "Table HELPDESK_TICKETS not found".
+
+
+
+
+
 
 
 
