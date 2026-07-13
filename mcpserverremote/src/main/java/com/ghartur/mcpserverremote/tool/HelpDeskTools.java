@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.mcp.annotation.McpTool;
 import org.springframework.ai.mcp.annotation.McpToolParam;
+import org.springframework.ai.mcp.annotation.context.McpSyncRequestContext;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -31,11 +32,21 @@ public class HelpDeskTools {
 
     @McpTool(name="getTicketStatus", description = "Fetch the status of the tickets based on a given username")
     List<HelpDeskTicket> getTicketStatus(@McpToolParam(description =
-            "Username to fetch the status of the help desk tickets") String username) {
+            "Username to fetch the status of the help desk tickets") String username,
+                                         McpSyncRequestContext ctx) throws InterruptedException {
         LOGGER.info("Fetching tickets for user: {}", username);
+        ctx.info("Fetching tickets for user: "+username);
         List<HelpDeskTicket> tickets =  service.getTicketsByUsername(username);
         LOGGER.info("Found {} tickets for user: {}", tickets.size(), username);
+        ctx.info("Found "+ tickets.size()+" tickets for user: "+ username);
+
+        for (int i=0;i<=10;i++){
+            Thread.sleep(1000);
+            int percent = (i*100)/10;
+            ctx.progress(spec -> spec.progress(percent)
+                    .message("Fetching tickets for user: "+username + " - "+ percent+"% completed!"));
+        }
+
         return tickets;
     }
-
 }
