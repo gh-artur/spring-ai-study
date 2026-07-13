@@ -211,16 +211,57 @@ Transport types (como client e server conversam):
   (JSON-RPC sobre HTTP, com streaming). Pra server externo/compartilhado.
 
 O que montei no estudo (mesma HelpDeskTools da seção de tool calling nos dois servers):
-- mcpclient: o HOST. Deps spring-ai-starter-mcp-client + model-openai. Declaro os servers no mcp-servers.json
-  (formato do Claude Desktop: mcpServers { nome: { command, args, env } }). O Spring AI sobe cada server, faz o
-  handshake, descobre as tools e me entrega um ToolCallbackProvider. No controller faço
-  .defaultTools(toolCallbackProvider) -> as tools MCP viram tools NORMAIS de tool calling: pro LLM é só mais uma
-  entrada no array "tools", ele nem sabe que veio de MCP. Botei request-timeout=60s porque o cold start do npx
-  (server filesystem) passava dos 20s default.
+- mcpclient: o HOST. Deps spring-ai-starter-mcp-client + model-openai. stdio -> declaro no mcp-servers.json
+  (formato do Claude Desktop: mcpServers { nome: { command, args } }); hoje só o filesystem (tirei o server stdio
+  de help desk e o github). streamable http -> conecta por PROPERTY, não pelo JSON, e a conexão tem um NOME
+  (streamable-http.connections.ARTUR.url=...). O Spring AI sobe/conecta cada server, faz o handshake e descobre as
+  tools -> viram tools NORMAIS de tool calling (pro LLM é só mais uma entrada no array "tools", ele nem sabe que veio
+  de MCP). Botei request-timeout=60s por causa do cold start do npx (filesystem). CUIDADO com dois nomes diferentes:
+  o nome da CONEXÃO (artur, no client) != o nome que o SERVER anuncia (helpdesk-mcp-server). Os handlers de callback
+  casam pelo nome da conexão (clients="artur"); o filtro/seleção de tools casa pelo nome do server.
 - mcpserverstdio: server via STDIO. spring-ai-starter-mcp-server-webmvc + web-application-type=none (roda sem
-  porta, puro stdio). Tools com @McpTool/@McpToolParam (equivalente ao @Tool local, mas expõe via MCP).
-- mcpserverremote: MESMAS tools, mas streamable http -> spring.ai.mcp.server.protocol=streamable + server.port=8090.
+  porta, puro stdio). Tools com @McpTool/@McpToolParam (equivalente ao @Tool local, mas expõe via MCP). Ficou só com
+  as 2 tools originais.
+- mcpserverremote: streamable http -> spring.ai.mcp.server.protocol=streamable + server.port=8090.
   Diferença central: roda UMA vez como web service e vários clients conectam por URL; não é "um processo por client".
+  DIVERGIU do stdio: é aqui que fiz progress/logging/sampling/elicitation (abaixo).
+
+-------------
+
+MCP - filtro e seleção de tools (client): nem toda tool descoberta precisa chegar no LLM. Dois níveis:
+- Filtro GLOBAL na descoberta: McpServerToolFilter implements McpToolFilter. O Spring AI chama test(info, tool) uma
+  vez por tool ao descobrir os servers; retornar false faz a tool NEM EXISTIR pro resto da app. Bloqueio por nome do
+  server (ex: github) ou da tool (ex: write_). É política fixa.
+- Seleção POR REQUEST: ToolUtil.selectToolsFor(clients, serverName, toolName). Em vez de mandar TODAS as tools em
+  toda chamada, escolho quais mandar naquela requisição (hint null/vazio = casa tudo) e monto ToolCallback[]. Por
+  isso o controller passou a injetar List<McpSyncClient> no lugar do ToolCallbackProvider.
+
+-------------
+
+MCP - progress + logging (server -> client): até aqui o fluxo era só client->server. Agora o SERVER manda mensagem de
+volta enquanto processa. A porta no server é o McpSyncRequestContext (ctx), um parâmetro extra na @McpTool: ctx.info(...)
+= logging, ctx.progress(...) = progresso 0..100%. No client escuto com @McpLogging (HelpDeskLogBridge) e @McpProgress
+(HelpDeskToolProgressListener), casando pelo nome da conexão (clients="artur"). Detalhe: o client manda um progressToken
+por request (.toolContext(Map.of("progressToken", uuid))) que CORRELACIONA as notificações àquela chamada.
+
+-------------
+
+MCP - sampling: INVERSÃO de papéis. Normal é o client (que tem a chave/LLM) chamar o server. No sampling o SERVER pede
+ao CLIENT que rode um completion de LLM por ele -> o server usa a inteligência do host SEM ter chave/modelo próprio. No
+server a tool chama ctx.sample(systemPrompt + message) (com ctx.sampleEnabled() + fallback se o client não suporta). No
+client respondo com @McpSampling (HelpDeskSamplingProvider): traduzo o request MCP num Prompt do Spring AI e chamo o
+ChatModel DIRETO (não o ChatClient com tools, senão o completion re-dispara as tools num loop). Exemplo: tool
+summarizeTickets + endpoint /summarize-tickets (o LLM do chat decide chamar a tool, que chama de volta o client pra
+gerar o resumo).
+
+-------------
+
+MCP - elicitation: parente do sampling, mas em vez de pedir um completion de LLM, o server pede um DADO ESTRUTURADO ao
+USUÁRIO. Antes de abrir o ticket, createTicket chama ctx.elicit(message, TicketContactInfo.class): o record vira o
+schema JSON que o client preenche, e a resposta é mapeada de volta no record (StructuredElicitResult). Tem
+ctx.elicitEnabled() + fallback (defaults MEDIUM/N/A) e as ações ACCEPT/DECLINE/CANCEL. No client respondo com
+@McpElicitation (HelpDeskElicitationProvider), simulando o preenchimento (ACCEPT). Resumo: sampling pede COMPLETION ao
+client; elicitation pede DADO ao usuário. Os dois = server chamando DE VOLTA o client.
 
 -------------
 

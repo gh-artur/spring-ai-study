@@ -67,16 +67,30 @@ directory, so run commands from the subproject root.
 ## Subprojects: MCP (client + servers)
 
 Three subprojects exploring the **Model Context Protocol** (see `NOTES.md` §14 and the MCP
-section of `CONCEITOS.md`). The two servers expose the **same help-desk tools**
-(`@McpTool` `createTicket`/`getTicketStatus`, JPA + H2); only the transport differs.
+section of `CONCEITOS.md`). Both servers started from the **same help-desk tools**
+(`@McpTool` `createTicket`/`getTicketStatus`, JPA + H2), but they have since **diverged**:
+only `mcpserverremote` grew the advanced capabilities (progress, logging, sampling,
+elicitation, and a `summarizeTickets` tool); `mcpserverstdio` still has just the original two.
 
-- `mcpclient` — the **host**. Discovers MCP servers declared in
-  `src/main/resources/mcp-servers.json` and exposes their tools to the LLM via a
-  `ToolCallbackProvider` (`.defaultTools(...)`). Endpoint `GET /api/chat`.
+- `mcpclient` — the **host**. Connects to two servers: `filesystem` over **stdio** (declared
+  in `src/main/resources/mcp-servers.json`) and the remote help-desk over **streamable HTTP**
+  (declared via `spring.ai.mcp.client.streamable-http.connections.artur.*` properties — the
+  connection is named **`artur`**). Instead of a global `ToolCallbackProvider`, it injects
+  `List<McpSyncClient>` and **selects tools per request** (`util/ToolUtil.selectToolsFor`),
+  with a global `McpToolFilter` (`util/McpServerToolFilter`) blocking tools at discovery.
+  Client-side callback handlers (`util/HelpDesk{Log,Sampling,Elicitation}*` +
+  `HelpDeskToolProgressListener`) bind to the connection via `clients = "artur"`. Endpoints:
+  `GET /api/chat` and `GET /api/summarize-tickets` (sampling demo).
 - `mcpserverstdio` — MCP server over **stdio** (`web-application-type=none`); the client
-  launches it as a subprocess (`java -jar`).
+  launches it as a subprocess (`java -jar`). Original two tools only.
 - `mcpserverremote` — MCP server over **streamable HTTP** (`spring.ai.mcp.server.protocol=
-  streamable`, port **8090**); clients connect by URL.
+  streamable`, name `helpdesk-mcp-server`, port **8090**); clients connect by URL. Its tools
+  take an `McpSyncRequestContext` to push progress/logging and to call back into the client
+  (`ctx.sample` for sampling, `ctx.elicit` for elicitation).
+
+> ⚠️ Two distinct names that are easy to confuse: the **client connection** name (`artur`,
+> which the `@Mcp*` handlers match on) vs. the **server-advertised** name (`helpdesk-mcp-server`,
+> which the tool filter/selection matches on).
 
 Gotchas (all hit during the study, documented in `NOTES.md` §14.4):
 

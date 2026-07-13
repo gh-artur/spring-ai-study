@@ -863,25 +863,35 @@ Como client e server trocam mensagens (sempre **JSON-RPC**), por baixo:
 
 ### 14.1 O Client (`mcpclient`)
 
-Deps: `spring-ai-starter-mcp-client` + `spring-ai-starter-model-openai` (+ webmvc pro endpoint REST). Os servers são declarados num JSON no **formato do Claude Desktop**:
+Deps: `spring-ai-starter-mcp-client` + `spring-ai-starter-model-openai` (+ webmvc pro endpoint REST). Cada **transport** é declarado de um jeito:
+
+**stdio** → num JSON no **formato do Claude Desktop** (`mcp-servers.json`). Hoje só sobra o `filesystem`; o server stdio de help desk (`mcpserverstdio`) e o `github` (docker) já foram removidos daqui:
 
 ```json
 // mcp-servers.json
 { "mcpServers": {
-    "spring-ai-mcp": { "command": "java.exe", "args": ["-jar", ".../mcpserverstdio-0.0.1-SNAPSHOT.jar"] },
-    "filesystem":    { "command": "cmd", "args": ["/c","npx","-y","@modelcontextprotocol/server-filesystem","C:\\Users\\Artur\\mcp"] },
-    "github":        { "command": "docker", "args": ["run","-i","--rm", "..."], "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "..." } }
+    "filesystem": { "command": "cmd", "args": ["/c","npx","-y","@modelcontextprotocol/server-filesystem","C:\\Users\\Artur\\mcp"] }
 } }
 ```
 
+**streamable HTTP** → o server remoto **não** entra no JSON; conecta por properties. A conexão recebe um **nome** (`artur`) que reaparece mais tarde nos handlers de callback (`@McpSampling(clients="artur")`, `@McpProgress`, etc. — ver §14.6+):
+
 ```properties
 spring.ai.mcp.client.stdio.servers-configuration=classpath:mcp-servers.json
+
+# conexao streamable-http para o mcpserverremote; "artur" e o NOME da conexao
+spring.ai.mcp.client.streamable-http.connections.artur.url=http://localhost:8090
+spring.ai.mcp.client.streamable-http.connections.artur.endpoint=mcp
+
 spring.ai.mcp.client.request-timeout=60s   # cold start do npx passava dos 20s default
 ```
 
-No boot, o Spring AI **sobe cada server** (stdio → subprocesso), faz o **handshake**, **descobre as tools** e entrega tudo num `ToolCallbackProvider`. O controller registra esse provider como tools default:
+> ⚠️ **Dois nomes que confundem:** o **nome da conexão** (`artur`, definido no client) é diferente do **nome que o server anuncia** (`spring.ai.mcp.server.name=helpdesk-mcp-server`, definido no `mcpserverremote`). Os handlers de callback casam pelo **nome da conexão** (`clients="artur"`); o filtro/seleção de tools casa pelo **nome do server** (`"helpdesk-mcp-server"` — ver §14.5).
+
+No boot, o Spring AI **sobe/conecta cada server**, faz o **handshake** e **descobre as tools**. A forma mais simples de expor essas tools ao LLM é pegar o `ToolCallbackProvider` auto-configurado e registrar como default:
 
 ```java
+// abordagem inicial (global): todas as tools de todos os servers viram default
 public MCPClientController(ChatClient.Builder builder, ToolCallbackProvider toolCallbackProvider) {
     this.chatClient = builder
             .defaultTools(toolCallbackProvider)   // as tools MCP viram tools normais
@@ -891,6 +901,8 @@ public MCPClientController(ChatClient.Builder builder, ToolCallbackProvider tool
 ```
 
 > **Ligação com a seção 11:** as tools MCP entram no **mesmo array `tools`** da requisição à OpenAI. Pro LLM é indistinguível de uma `@Tool` local — ele nem sabe que veio de um server MCP. MCP muda **de onde vem** a tool, não como o modelo a usa.
+
+> 🔄 **Evolução:** o controller **saiu** desse `.defaultTools(provider)` global e passou a injetar a lista de `McpSyncClient` e **escolher as tools por requisição** (com um filtro global por cima). Ver §14.5.
 
 ### 14.2 Server via stdio (`mcpserverstdio`)
 
@@ -916,6 +928,101 @@ Diferença central pro stdio: sobe **uma vez** como web service e **vários clie
 - **`mvnw` usa o `JAVA_HOME`, não o `java` do PATH.** Dava `release version 25 not supported` **mesmo com `java -version` = 25**, porque o `JAVA_HOME` apontava pro JDK 17. `mise activate` no profile do shell mantém o `JAVA_HOME` alinhado ao `mise.toml`.
 - **`@McpTool` que grava no banco precisa da tabela.** Sem `spring.jpa.hibernate.ddl-auto=update`, o H2 **file** sobe vazio → o insert quebra com `Table "HELPDESK_TICKETS" not found` (o `create-drop` automático só vale pra H2 **em memória**).
 
+> 🧭 **As capacidades avançadas a seguir (§14.5–14.8) foram feitas só no `mcpserverremote`** (streamable HTTP). O `mcpserverstdio` continua com as duas tools originais (`createTicket`/`getTicketStatus` sem `McpSyncRequestContext`) — os dois servers **divergiram**.
+
+### 14.5 Filtro e seleção de tools (client)
+
+Nem toda tool descoberta precisa chegar ao LLM. Há **dois níveis** de controle, em momentos diferentes:
+
+**Filtro global (na descoberta)** — `McpServerToolFilter implements McpToolFilter`. O Spring AI chama o `test(...)` **uma vez por tool** ao descobrir os servers; retornar `false` faz a tool **nem existir** pro resto da app. Decide pelo **nome do server** (`McpConnectionInfo.initializeResult().serverInfo().name()`) ou pelo nome da tool:
+
+```java
+@Component
+public class McpServerToolFilter implements McpToolFilter {
+    @Override
+    public boolean test(McpConnectionInfo info, McpSchema.Tool tool) {
+        String server = info.initializeResult().serverInfo().name();
+        if (server.toLowerCase().contains("github")) return false; // bloqueia server inteiro
+        if (tool.name().contains("write_")) return false;          // bloqueia tools de escrita
+        return true;
+    }
+}
+```
+
+**Seleção por requisição** — `ToolUtil.selectToolsFor(mcpClients, serverName, toolName)`. Em vez de mandar **todas** as tools em toda chamada, percorre a lista de `McpSyncClient`, filtra por nome de server/tool (hint `null`/vazio = "casa tudo") e monta um `ToolCallback[]` via `SyncMcpToolCallback`. Por isso o controller passou a injetar `List<McpSyncClient>` no lugar do `ToolCallbackProvider`:
+
+```java
+// escolhe só as tools do "helpdesk-mcp-server" pra ESTA chamada
+ToolCallback[] toolCallbacks = ToolUtil.selectToolsFor(mcpClients, "helpdesk-mcp-server");
+chatClient.prompt().tools(toolCallbacks).user(...).call().content();
+```
+
+> **Filtro global vs. seleção por request:** o filtro é **política fixa** aplicada na descoberta (a tool some pra sempre); a seleção decide **caso a caso** quais tools mandar naquela requisição. O `serverName` usado na seleção é o **nome que o server anuncia** (`helpdesk-mcp-server`), não o nome da conexão (`artur`).
+
+### 14.6 Notificações do server → client: progress + logging
+
+Até aqui o fluxo era só client→server (chama a tool, recebe o resultado). Agora o **server manda mensagens de volta** enquanto processa. A porta de entrada no server é o `McpSyncRequestContext` (`ctx`), um **parâmetro extra** na `@McpTool`:
+
+```java
+List<HelpDeskTicket> getTicketStatus(@McpToolParam(...) String username,
+                                     McpSyncRequestContext ctx) throws InterruptedException {
+    ctx.info("Fetching tickets for user: " + username);           // LOGGING p/ o client
+    // ... busca ...
+    for (int i = 0; i <= 10; i++) {                               // PROGRESS 0..100%
+        Thread.sleep(1000);
+        int percent = i * 100 / 10;
+        ctx.progress(spec -> spec.progress(percent).message(percent + "% completed!"));
+    }
+    return tickets;
+}
+```
+
+No **client**, dois beans escutam essas notificações (casando pelo **nome da conexão**, `clients="artur"`):
+
+| Notificação | Server envia | Client escuta |
+|-------------|--------------|---------------|
+| Logging | `ctx.info(...)` | `@McpLogging` → `HelpDeskLogBridge` |
+| Progress | `ctx.progress(...)` | `@McpProgress` → `HelpDeskToolProgressListener` |
+
+> **`progressToken`:** o client injeta um token por requisição via `.toolContext(Map.of("progressToken", UUID.randomUUID()...))`; é ele que **correlaciona** as notificações de progresso àquela chamada específica (aparece no `ProgressNotification.progressToken()`).
+
+### 14.7 Sampling — o server pede um completion ao client
+
+**Inversão de papéis:** normalmente o client (que tem a chave da OpenAI e o LLM) chama o server. No **sampling**, o **server** pede ao **client** que rode um completion de LLM por ele — o server usa a "inteligência" do host **sem ter chave/modelo próprio**.
+
+No server, a tool `summarizeTickets` monta um prompt e chama `ctx.sample(...)`:
+
+```java
+if (!ctx.sampleEnabled()) return tickets.toString();   // client não anunciou a capability -> fallback
+McpSchema.CreateMessageResult result = ctx.sample(spec -> spec
+        .systemPrompt(systemPrompt)
+        .message("Here are the support tickets ...\n" + ticketData));
+String summary = ((McpSchema.TextContent) result.content()).text();
+```
+
+No client, o handler é `@McpSampling` (`HelpDeskSamplingProvider`): traduz o `CreateMessageRequest` do MCP em `Prompt` do Spring AI e chama o **`ChatModel` direto** (`chatModel.call(prompt)`), **não** o `ChatClient` com tools — assim o completion do sampling **não re-dispara** as tools MCP num loop.
+
+> **Endpoint `/api/summarize-tickets`:** quem dirige é o LLM do chat — ele vê a tool `summarizeTickets` e decide chamá-la; a tool (no server) chama de volta o client via sampling pra gerar o texto. O system prompt do endpoint manda devolver a saída da tool **verbatim**, pra não reescrever o resumo já pronto.
+
+### 14.8 Elicitation — o server pede dados ao usuário (via client)
+
+Parente do sampling, mas em vez de pedir um **completion de LLM**, o server pede um **dado estruturado ao usuário humano**. Antes de abrir o ticket, `createTicket` pede `priority` + `contactPhone`:
+
+```java
+if (ctx.elicitEnabled()) {
+    StructuredElicitResult<TicketContactInfo> r = ctx.elicit(
+            spec -> spec.message("Choose a priority (LOW/MEDIUM/HIGH/URGENT) and a contact phone."),
+            TicketContactInfo.class);          // o record vira o 'requestedSchema' JSON
+    if (r.action() == McpSchema.ElicitResult.Action.ACCEPT && r.structuredContent() != null) {
+        // usa r.structuredContent().priority() / .contactPhone()
+    }
+} // senão: fallback pros defaults (MEDIUM / N/A)
+```
+
+O `record TicketContactInfo(String priority, String contactPhone)` é convertido no schema que o client deve preencher, e a resposta do client é mapeada **de volta** no record. No client, `@McpElicitation` (`HelpDeskElicitationProvider`) responde — no estudo simula o preenchimento retornando `ACCEPT` com dados fixos. Ações possíveis: **ACCEPT / DECLINE / CANCEL** (as duas últimas caem no fallback).
+
+> **Sampling vs. elicitation** (ambos = server chamando **de volta** o client): sampling pede **completion de LLM**; elicitation pede **dado estruturado ao usuário**. Efeito colateral no modelo: `HelpDeskTicket` ganhou os campos `priority` e `contactPhone`, e `service.createTicket(...)` agora recebe esses valores.
+
 ---
 
 ## Resumo geral (default vs. por requisição)
@@ -940,4 +1047,5 @@ Diferença central pro stdio: sobe **uma vez** como web service e **vários clie
 - **Tool Calling** = o LLM pede pra executar um método `@Tool` seu (ex. `TimeTools`), decidindo nome + argumentos; a app roda e devolve o resultado pro modelo finalizar. As tools vão num **campo separado** da requisição (array `tools` = nome + description + JSON Schema), **não** no texto do prompt; são **duas** idas ao modelo por chamada.
 - **Toggle de RAG** = tudo que é RAG (Qdrant, docker-compose, ingestão, clients que dependem de `VectorStore`/cache) fica atrás do profile `rag`, **off por padrão** pra boot rápido; liga com `-Dspring-boot.run.profiles=rag`.
 - **Tool Calling + DB / `ToolContext`** = tools que operam no banco (help desk: `createTicket`/`getTicketStatus` via JPA). Argumentos `@ToolParam` (ex. `TicketRequest`) são preenchidos pelo **LLM** (vão no schema); o `ToolContext` (ex. `username`) é preenchido pela **app** e **invisível ao modelo** (bom pra identidade/segurança). `@Tool(returnDirect=true)` faz o retorno da tool ser a resposta final (sem 2ª ida ao modelo).
-- **MCP (Model Context Protocol)** = tool calling com as capacidades **num server separado**, não dentro da app. Papéis **Host** (a app/LLM) → **Client** (conector, 1:1 com um server) → **Server** (expõe as tools). Dois transports: **stdio** (server local subido **pelo próprio client** como processo, JSON-RPC por stdin/stdout — 1 processo por client) e **streamable HTTP** (server web numa porta, vários clients por URL). No client (`mcpclient`), o Spring AI descobre as tools do server e as entrega num `ToolCallbackProvider` → `.defaultTools(...)`, e elas viram tools **normais** no array `tools` (o LLM não sabe que vieram de MCP). Servers de estudo: `mcpserverstdio` (stdio, `@McpTool` + `web-application-type=none`) e `mcpserverremote` (streamable, `:8090`).
+- **MCP (Model Context Protocol)** = tool calling com as capacidades **num server separado**, não dentro da app. Papéis **Host** (a app/LLM) → **Client** (conector, 1:1 com um server) → **Server** (expõe as tools). Dois transports: **stdio** (server local subido **pelo próprio client** como processo, JSON-RPC por stdin/stdout — 1 processo por client) e **streamable HTTP** (server web numa porta, vários clients por URL). No client (`mcpclient`), o Spring AI descobre as tools do server e elas viram tools **normais** no array `tools` (o LLM não sabe que vieram de MCP). Começou com `.defaultTools(toolCallbackProvider)` (global) e **evoluiu** para injetar `List<McpSyncClient>` e **selecionar tools por requisição** (`ToolUtil.selectToolsFor`), com um **filtro global** por cima (`McpToolFilter`, bloqueia server/tool na descoberta — §14.5). Servers de estudo: `mcpserverstdio` (stdio, `@McpTool` + `web-application-type=none`) e `mcpserverremote` (streamable, `:8090`).
+- **Capacidades MCP além de tools** (feitas só no `mcpserverremote`, via `McpSyncRequestContext` no server + handlers `@Mcp*` no client, casando pelo nome da conexão `artur`): **progress** (`ctx.progress` → `@McpProgress`) e **logging** (`ctx.info` → `@McpLogging`) = server manda notificações **de volta** ao client enquanto processa (§14.6); **sampling** (`ctx.sample` → `@McpSampling`) = server pede um **completion de LLM** ao client, usando a inteligência do host sem ter chave própria (§14.7); **elicitation** (`ctx.elicit` → `@McpElicitation`) = server pede um **dado estruturado ao usuário** (schema derivado de um `record`) antes de agir (§14.8). Sampling e elicitation invertem o fluxo: é o **server chamando de volta o client**.
