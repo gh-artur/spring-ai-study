@@ -40,10 +40,10 @@ public class ChatMemoryChatClientConfig {
     RetrievalAugmentationAdvisor retrievalAugmentationAdvisor(VectorStore vectorStore,
                                                               ChatClient.Builder chatClientBuilder) {
         return RetrievalAugmentationAdvisor.builder()
-                .queryTransformers(TranslationQueryTransformer.builder()
-                        .chatClientBuilder(chatClientBuilder.clone())
-                        .targetLanguage("english")
-                        .build())
+//                .queryTransformers(TranslationQueryTransformer.builder()
+//                        .chatClientBuilder(chatClientBuilder.clone())
+//                        .targetLanguage("english")
+//                        .build())
                 .documentRetriever(VectorStoreDocumentRetriever.builder()
                         .vectorStore(vectorStore)
                         .topK(3)
