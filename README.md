@@ -66,15 +66,7 @@ structured output + system prompt**, amarrados pelo **loop autônomo** do Spring
 
 ### Arquitetura
 
-```mermaid
-flowchart LR
-    C(["📧 Cliente"]) -- e-mail --> M["Mailpit<br/>(SMTP :1025 / REST :8025)"]
-    M -- poll --> A["support-agent<br/>host + LLM (OpenAI)"]
-    A -- "MCP streamable HTTP :8090" --> S["mcp-server<br/>(tools de consulta + ação)"]
-    S -- JPA --> DB[("MySQL :3306<br/>clientes, pedidos,<br/>pagamentos, tickets")]
-    A -- "resposta (SMTP)" --> M
-    M -- "Re: ..." --> C
-```
+![Arquitetura do support-agent-demo: o scheduler faz polling na caixa de e-mails, entrega cada mensagem ao AI Agent (que usa o LLM como cérebro e as tools do MCP server para ler/atualizar o banco) e responde o cliente com base nas ações tomadas.](support-agent-demo/diagram.png)
 
 Como funciona, em uma frase por passo:
 
