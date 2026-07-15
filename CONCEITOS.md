@@ -277,7 +277,67 @@ MCP na prática — o que me quebrou (e o porquê):
 - @McpTool que grava no banco precisa da tabela: sem spring.jpa.hibernate.ddl-auto=update o H2 file sobe vazio e o
   insert quebra com "Table HELPDESK_TICKETS not found".
 
+-------------
 
+Multimodalidade (áudio e imagem): a mesma ideia do chat, mas com modelos que entram/saem em
+outra mídia — no Spring AI cada um tem seu model bean.
+- Speech-to-Text (transcrição): TranscriptionModel (Whisper). Mando um Resource de áudio num
+  AudioTranscriptionPrompt e recebo o texto. Dá pra passar opções (idioma, temperature, e o
+  responseFormat — ex. VTT com timestamps de legenda em vez de texto puro).
+- Text-to-Speech (TTS): TextToSpeechModel. Passo texto e recebo bytes de áudio (gravei num
+  output.mp3). Nas opções escolho voz (ex. NOVA), velocidade e formato (MP3).
+- Image generation: ImageModel + ImagePrompt. Retorna a imagem em base64 (b64Json). Nas
+  opções dá pra pedir n imagens e trocar o model.
+Ponto-chave: não é "prompt de texto puro" — a entrada/saída é binária (Resource/byte[]), mas o
+ciclo (prompt -> model.call -> response) é o mesmo do ChatModel.
+
+-------------
+
+AI Agent
+
+Reason -> Act -> Observe -> Repeat
+
+Um AGENT é um LLM solto num loop com FERRAMENTAS e um OBJETIVO: em vez de eu orquestrar cada
+passo, dou a meta + as tools e o modelo decide sozinho o que fazer, faz, observa o resultado e
+repete até resolver. É tool calling (seção acima) levado ao extremo — várias idas ao modelo em
+cadeia, TODAS automáticas. No Spring AI eu nem escrevo o loop: entrego as tools ao ChatClient
+(.defaultTools) e o framework roda Reason->Act->Observe->Repeat por mim; meu trabalho é só o
+system prompt (as instruções de como trabalhar) e o input.
+
+Agent vs. chatbot com tools: o chatbot chama 1 tool e responde. O agent encadeia MUITAS chamadas
+por conta própria (identifica o cliente -> puxa pedidos -> checa cobrança duplicada -> decide ->
+emite refund -> loga ticket) sem eu dizer a ordem. Autonomia = ele escolhe QUAIS tools, em que
+ORDEM e QUANDO parar.
+
+O que montei (support-agent-demo, o projeto final do curso): um agente de suporte que trabalha
+uma caixa de e-mails de e-commerce SOZINHO. São DUAS apps:
+- mcp-server (MySQL, streamable HTTP :8090): expõe como @McpTool a ÚNICA janela do agente pros
+  sistemas da empresa. Tools de leitura (achar cliente por e-mail, pedidos, produto/SKU, detectar
+  cobrança duplicada, checar garantia, histórico de tickets) e de AÇÃO (emitir refund, logar
+  ticket). O banco é semeado com dados de propósito p/ 4 cenários (datas relativas ao CURDATE).
+- support-agent (host + LLM): um InboxMonitor faz polling numa caixa Mailpit (fake SMTP + REST);
+  cada e-mail novo vira um IncomingEmail e é entregue ao SupportAgent (ChatClient com TODAS as
+  tools do MCP + o system prompt). O LLM lê o e-mail, chama as tools que precisar, decide a
+  resolução e devolve structured output (AgentResponse: replySubject/replyBody + operatorSummary);
+  aí o SupportMailSender responde o cliente por SMTP, no idioma/tom dele.
+
+O que amarra tudo: o agent é a soma do curso — tool calling + MCP (streamable HTTP) + structured
+output + system prompt/prompt template + o loop autônomo do Spring AI.
+
+Regras que ficam no SYSTEM PROMPT (é aqui que a autonomia vira confiável): "você só enxerga o
+que as tools retornam — nunca invente dado"; a ORDEM sugerida (identificar -> entender -> juntar
+fatos -> decidir -> logar ticket sempre no fim); e as GUARDAS de ação real ("só emita refund se
+o dado justificar — refund mexe dinheiro de verdade; não chame a tool especulativamente").
+Separei tools de LEITURA (@Transactional(readOnly=true)) das de ESCRITA de propósito: ação real
+(mover dinheiro) tem que ser deliberada, não efeito colateral de uma consulta.
+
+Pontos de atenção (vividos):
+- Duas stacks Docker, dois compose.yaml (MySQL no server, Mailpit no agent). Subo o server 1º.
+- Seed roda só em volume NOVO; datas são relativas (CURDATE - INTERVAL n DAY) p/ os cenários não
+  "vencerem". Pra re-semear: docker compose down -v.
+- A resposta do agente TAMBÉM cai no Mailpit -> filtro a busca (to:support !from:support) senão
+  ele reprocessa o próprio e-mail num loop infinito.
+- ddl-auto=none no server: o schema é dono do SQL de init, Hibernate não pode recriar/derrubar.
 
 
 

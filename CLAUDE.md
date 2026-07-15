@@ -17,9 +17,13 @@ only the shared study notes and repo-wide config, not source code.
 ├── CONCEITOS.md        <- concept summaries
 ├── mise.toml           <- repo-wide toolchain (Java 25)
 ├── spring-ai-playground/   <- subproject: Spring AI feature playground (OpenAI chat)
+├── springai/               <- subproject: multimodal demos (audio transcription/TTS, image gen)
 ├── mcpclient/              <- subproject: MCP client/host — consumes MCP servers as tools
 ├── mcpserverstdio/         <- subproject: MCP server over stdio (local help-desk tools)
-└── mcpserverremote/        <- subproject: MCP server over streamable HTTP (:8090)
+├── mcpserverremote/        <- subproject: MCP server over streamable HTTP (:8090)
+└── support-agent-demo/     <- capstone: autonomous email-support AGENT + its MCP server
+    ├── mcp-server/         <-   MCP server (streamable HTTP :8090) over a seeded MySQL DB
+    └── support-agent/      <-   the agent: watches a Mailpit inbox, resolves & replies
 ```
 
 Each subproject is independent: there is **no parent/aggregator POM**. Build and run
@@ -105,3 +109,56 @@ Gotchas (all hit during the study, documented in `NOTES.md` §14.4):
   the shell profile keeps `JAVA_HOME` aligned with `mise.toml`.
 - MCP servers that persist need `spring.jpa.hibernate.ddl-auto=update`, else the file-based
   H2 starts empty and inserts fail with `Table "HELPDESK_TICKETS" not found`.
+
+## Subproject: springai
+
+A small **multimodal** playground (separate Spring Initializr project, package
+`com.eazybytes.springai`) that exercises the non-text OpenAI models via Spring AI:
+
+- `AudioController` (`/api/*`): speech-to-text with `TranscriptionModel` (Whisper, plus a
+  `transcribe-options` variant that sets language/temperature/`VTT` format), and text-to-speech
+  with `TextToSpeechModel` (writes `output.mp3` / `speech-options.mp3`, the second picking a
+  voice/speed/format).
+- `ImageController` (`/api/image`, `/api/image-options`): image generation with `ImageModel`
+  (returns base64 JSON).
+
+Needs `OPENAI_API_KEY`. See `NOTES.md` §15.
+
+## Subproject: support-agent-demo (capstone)
+
+The course finale — an **autonomous AI agent** that works a support mailbox end to end, built
+as **two independent apps** under one folder (each with its own `pom.xml`/wrapper; still no
+aggregator POM). It ties together everything above: tool calling, MCP (streamable HTTP),
+structured output, and system prompting. See `NOTES.md` §16 and the "AI Agent" section of
+`CONCEITOS.md`.
+
+- `mcp-server` (`com.eazybytes.mcp.server`, streamable HTTP on **:8090**, name
+  `support-agent-mcp-server`) — exposes the agent's only window into company systems as MCP
+  tools over a **MySQL** database (Docker Compose auto-started; schema + demo data seeded from
+  `db/init/*.sql`, so `spring.jpa.hibernate.ddl-auto=none`). Two tool classes: `SupportQueryTools`
+  (read-only: `lookup_customer_by_email`, `get_customer_orders`, `get_order_by_number`,
+  `search_products`, `get_product_by_sku`, `detect_duplicate_charges`, `check_warranty`,
+  `get_customer_ticket_history`) and `SupportActionTools` (writes: `issue_refund`,
+  `log_support_ticket`).
+- `support-agent` (`com.eazybytes.support.agent`) — the host/agent (`spring-ai-starter-mcp-client`
+  + `model-openai`). `InboxMonitor` polls a **Mailpit** inbox (REST on :8025) on a fixed delay;
+  each unread mail becomes an `IncomingEmail` and is handed to `SupportAgent`, a `ChatClient`
+  wired with **all** MCP tools (`.defaultTools(toolCallbackProvider)`) and the
+  `support-agent-system.st` system prompt. The LLM drives the whole Reason→Act→Observe loop
+  itself (Spring AI auto-executes the tools); the result is structured output (`AgentResponse`
+  = `replySubject`/`replyBody`/`operatorSummary`). `SupportMailSender` emails the reply back over
+  SMTP (:1025), threaded onto the original. `POST /seed-mail` drops a test email into the inbox.
+
+Gotchas specific to the capstone:
+
+- **Two Docker stacks, two `compose.yaml`s.** `mcp-server` starts MySQL (:3306, named volume);
+  `support-agent` starts Mailpit (:1025 SMTP / :8025 UI+REST). Each app's
+  `spring.docker.compose.file` points at its own — bring the server up first.
+- **Seed data is date-relative.** `db/init/02-seed.sql` uses `CURDATE() - INTERVAL n DAY`, so the
+  four demo scenarios (goodwill refund, pre-sales voltage question, duplicate charge on #4471,
+  multilingual/multi-intent) stay valid whenever the MySQL volume is first created. Seed scripts
+  only run on a **fresh** volume — `docker compose down -v` to reseed.
+- **The agent's outbound replies also land in Mailpit.** `MailpitClient.listUnread` scopes the
+  query to `to:support@… !from:support@…` so the agent never reprocesses its own replies.
+- Both apps default the MCP server to **:8090** — the agent connects by URL
+  (`spring.ai.mcp.client.streamable-http.connections.support-agent.url`).

@@ -1025,6 +1025,194 @@ O `record TicketContactInfo(String priority, String contactPhone)` é convertido
 
 ---
 
+## 15. Multimodalidade — áudio e imagem (`springai`)
+
+Até aqui tudo era **texto**. O subprojeto `springai` (Spring Initializr novo, pacote
+`com.eazybytes.springai`) exercita os modelos **não-textuais** da OpenAI. A sacada: o **ciclo é o
+mesmo** do `ChatModel` (`prompt -> model.call(...) -> response`), o que muda é que a entrada/saída
+é **binária** (`Resource` / `byte[]`), e cada modalidade tem seu **próprio bean de model**.
+
+### 15.1 Speech-to-Text — `TranscriptionModel` (Whisper)
+
+```java
+@GetMapping("/transcribe")
+String transcribe(@Value("classpath:SpringAI.mp3") Resource audioFile) {
+    var response = transcriptionModel.call(new AudioTranscriptionPrompt(audioFile));
+    return response.getResult().getOutput();          // texto transcrito
+}
+```
+
+Com opções dá pra guiar a transcrição — `prompt` (contexto), `language`, `temperature` e,
+importante, o **`responseFormat`**: `VTT` devolve **legenda com timestamps** em vez de texto puro.
+
+```java
+transcriptionModel.call(new AudioTranscriptionPrompt(audioFile,
+        OpenAiAudioTranscriptionOptions.builder()
+                .prompt("Talking about Spring AI").language("en")
+                .temperature(0.5f).responseFormat(AudioResponseFormat.VTT).build()));
+```
+
+### 15.2 Text-to-Speech — `TextToSpeechModel`
+
+Caminho inverso: texto **entra**, áudio (`byte[]`) **sai** — gravei num arquivo.
+
+```java
+byte[] audioBytes = textToSpeechModel.call(message);
+Files.write(Paths.get("output.mp3"), audioBytes);
+```
+
+Nas opções escolho **voz** (ex. `NOVA`), **velocidade** e **formato** (`MP3`):
+
+```java
+textToSpeechModel.call(new TextToSpeechPrompt(message,
+        TextToSpeechOptions.builder()
+                .voice(OpenAiAudioSpeechOptions.Voice.NOVA.getValue())
+                .speed(2.0)
+                .format(OpenAiAudioSpeechOptions.AudioResponseFormat.MP3.getValue()).build()));
+```
+
+### 15.3 Image generation — `ImageModel`
+
+```java
+var imageResponse = imageModel.call(new ImagePrompt(message));
+return imageResponse.getResults().get(0).getOutput().getB64Json();   // imagem em base64
+```
+
+Nas opções (`OpenAiImageOptions`): `n` (quantas imagens) e `model`. Saída em **base64** (`b64Json`).
+
+### Pontos de atenção (multimodal)
+
+- Cada modalidade = **um bean diferente** (`TranscriptionModel`, `TextToSpeechModel`, `ImageModel`)
+  autoconfigurado pelo `spring-ai-starter-model-openai`. Não é o mesmo `ChatModel`.
+- Entrada/saída é **binária**: TTS/imagem devolvem `byte[]`/base64, transcrição recebe um `Resource`.
+- Precisa do `OPENAI_API_KEY` igual ao resto (`spring.ai.openai.api-key=${OPENAI_API_KEY}`).
+
+---
+
+## 16. AI Agent — o projeto final (`support-agent-demo`)
+
+O **capstone** do curso: um **agente autônomo** que trabalha uma caixa de e-mails de suporte de
+e-commerce **sozinho**. É a soma de tudo — **tool calling + MCP (streamable HTTP) + structured
+output + system prompt** — amarrado pelo **loop autônomo** do Spring AI.
+
+### 16.1 O que é um agent (vs. tool calling comum)
+
+```
+Reason -> Act -> Observe -> Repeat
+```
+
+Um agent é um LLM num **loop com ferramentas e um objetivo**. Em vez de eu orquestrar cada passo,
+dou a **meta + as tools** e o modelo decide sozinho **quais** tools chamar, **em que ordem** e
+**quando parar**. É o tool calling da §11/§13 levado ao extremo: várias idas ao modelo **em
+cadeia, todas automáticas**. No Spring AI eu **não escrevo o loop** — entrego as tools ao
+`ChatClient` e o framework roda `Reason->Act->Observe->Repeat`. Meu trabalho é o **system prompt**
+(como trabalhar) e o **input** (o e-mail).
+
+- **Chatbot com tools:** chama 1 tool e responde.
+- **Agent:** encadeia **muitas** chamadas por conta própria (identifica cliente → puxa pedidos →
+  detecta cobrança duplicada → decide → emite refund → loga ticket) **sem eu dizer a ordem**.
+
+### 16.2 Arquitetura — duas apps independentes
+
+Sob `support-agent-demo/` moram **duas apps** (cada uma com seu `pom.xml`/wrapper; ainda **sem**
+POM agregador):
+
+```
+Cliente ──e-mail──▶ Mailpit (:1025 SMTP / :8025 REST)
+                        │  poll
+                        ▼
+                 support-agent (host + LLM)  ──MCP streamable HTTP :8090──▶  mcp-server  ──JPA──▶  MySQL (:3306)
+                        │                                                     (tools = janela p/ os sistemas)
+                        └──resposta (SMTP)──▶ Mailpit ──▶ Cliente
+```
+
+- **`mcp-server`** (`com.eazybytes.mcp.server`, streamable HTTP **:8090**, nome
+  `support-agent-mcp-server`): expõe como `@McpTool` a **única janela** do agente pros sistemas da
+  empresa, sobre um **MySQL** (Docker Compose auto-sobe; schema + dados de `db/init/*.sql`, então
+  `spring.jpa.hibernate.ddl-auto=none`). Dois grupos de tools:
+  - **Leitura** (`SupportQueryTools`, `@Transactional(readOnly=true)`): `lookup_customer_by_email`,
+    `get_customer_orders`, `get_order_by_number`, `search_products`, `get_product_by_sku`,
+    `detect_duplicate_charges`, `check_warranty`, `get_customer_ticket_history`.
+  - **Ação/escrita** (`SupportActionTools`, `@Transactional`): `issue_refund`, `log_support_ticket`.
+- **`support-agent`** (`com.eazybytes.support.agent`, host + LLM): watch da caixa + o cérebro.
+
+### 16.3 O laço da caixa de entrada (`InboxMonitor`)
+
+```java
+@Scheduled(fixedDelayString = "${support-agent.inbox.poll-interval:10000}")
+public void poll() {
+    for (var summary : mailpit.listUnread(props.batchSize())) processOne(summary.id());
+}
+```
+
+- Estado read/unread mora **no Mailpit**: buscar a mensagem completa a **marca como lida** — é
+  assim que não reprocesso. Se o handler falhar, volto pra **unread** → a próxima varredura tenta
+  de novo (`AgentEmailHandler` devolve `false`; retry natural).
+- `MailpitClient.listUnread` escopa a busca (`is:unread to:support@… !from:support@…`) — as
+  **próprias respostas** do agente também caem no Mailpit, e sem esse filtro ele **entraria em
+  loop** reprocessando o que mandou.
+
+### 16.4 O cérebro (`SupportAgent`) — Spring AI roda o loop
+
+```java
+this.chatClient = chatClientBuilder
+        .defaultSystem(sys -> sys.text(systemPrompt).param("support_address", inbox.address()))
+        .defaultTools(mcpTools)   // ToolCallbackProvider do starter-mcp-client = TODAS as tools MCP
+        .build();
+...
+return chatClient.prompt().user(/* o e-mail */).call().entity(AgentResponse.class);
+```
+
+- `.defaultTools(mcpTools)` = expõe **todas** as tools que o server publica; o Spring AI
+  **auto-executa** o loop de tool calling (quantos passos o modelo precisar). Diferente do
+  `mcpclient` da §14, aqui **não** seleciono tools por request — o agent recebe tudo.
+- `.entity(AgentResponse.class)` = **structured output** (§3): a saída final vira um record
+  `AgentResponse(replySubject, replyBody, operatorSummary)`. Separa **duas audiências**: o
+  `replyBody` (e-mail pro cliente) e o `operatorSummary` (nota interna pro humano do log). As
+  `@JsonPropertyDescription` viram o schema que o modelo preenche.
+- `SupportMailSender` manda o `replyBody` de volta por **SMTP**, com `In-Reply-To`/`References` pra
+  encadear na conversa original (vira "Re: …", não um e-mail novo).
+
+### 16.5 Autonomia confiável = system prompt (`support-agent-system.st`)
+
+A autonomia só é segura por causa das **regras no system prompt**:
+
+1. **"Você só enxerga o que as tools retornam — nunca invente"** dado de cliente, pedido, valor ou
+   política. Se uma tool falha/volta vazia, trabalhe com o que tem.
+2. **Ordem sugerida:** identificar o remetente → entender a intenção/sentimento → juntar os fatos
+   → **decidir** → **sempre logar um ticket no fim** (é o sistema de registro, nunca pular).
+3. **Guardas de ação real:** *"só emita refund quando o dado justificar (cobrança duplicada
+   confirmada, falha na garantia) — refund mexe dinheiro de verdade, não chame a tool
+   especulativamente"*. Foi por isso que **separei** tools de leitura (`readOnly`) das de escrita:
+   ação real tem que ser **deliberada**, não efeito colateral de uma consulta.
+4. **Reply pronta pra enviar:** no idioma/tom do cliente, sem placeholders, sem mencionar tools/
+   tickets/ids/IA.
+
+### 16.6 Os 4 cenários semeados (`db/init/02-seed.sql`)
+
+Os dados existem de propósito pra exercitar o agente ponta a ponta (datas **relativas** ao
+`CURDATE()` pra nunca "vencerem"):
+
+1. **Sarah** — jarra do liquidificador rachada pela **3ª vez** → o histórico de tickets mostra 2
+   falhas anteriores ⇒ **goodwill refund**.
+2. **Pré-venda** — "o X200 funciona em 230V europeu?" → responde **direto do `specifications`
+   JSON** do produto, sem precisar de pedido.
+3. **Priya** — "fui cobrada duas vezes no pedido #4471" → `detect_duplicate_charges` acha **duas
+   capturas** do mesmo valor ⇒ refunda **exatamente uma**, amarrada ao `transactionRef`.
+4. **Rohan** — sarcástico, **meio em hindi**, com **dois** problemas → multilíngue + multi-intent.
+
+### 16.7 Pontos de atenção (capstone)
+
+- **Duas stacks Docker, dois `compose.yaml`** — MySQL (no `mcp-server`) e Mailpit (no
+  `support-agent`); cada app aponta seu `spring.docker.compose.file` pro seu. **Suba o server 1º.**
+- **Seed só roda em volume novo** (script de init do MySQL). Pra re-semear: `docker compose down -v`.
+- **Respostas do agente também caem no Mailpit** → o filtro `!from:support@…` evita o loop.
+- **`ddl-auto=none`** no server: o schema é dono do SQL; Hibernate **não** pode recriar/derrubar.
+- `POST /seed-mail?from=…&subject=…&body=…` injeta um e-mail de teste na caixa (via SMTP) pra o
+  monitor ter o que pegar.
+
+---
+
 ## Resumo geral (default vs. por requisição)
 
 | Conceito        | Global (no Builder)      | Pontual (no `prompt()`) |
@@ -1049,3 +1237,5 @@ O `record TicketContactInfo(String priority, String contactPhone)` é convertido
 - **Tool Calling + DB / `ToolContext`** = tools que operam no banco (help desk: `createTicket`/`getTicketStatus` via JPA). Argumentos `@ToolParam` (ex. `TicketRequest`) são preenchidos pelo **LLM** (vão no schema); o `ToolContext` (ex. `username`) é preenchido pela **app** e **invisível ao modelo** (bom pra identidade/segurança). `@Tool(returnDirect=true)` faz o retorno da tool ser a resposta final (sem 2ª ida ao modelo).
 - **MCP (Model Context Protocol)** = tool calling com as capacidades **num server separado**, não dentro da app. Papéis **Host** (a app/LLM) → **Client** (conector, 1:1 com um server) → **Server** (expõe as tools). Dois transports: **stdio** (server local subido **pelo próprio client** como processo, JSON-RPC por stdin/stdout — 1 processo por client) e **streamable HTTP** (server web numa porta, vários clients por URL). No client (`mcpclient`), o Spring AI descobre as tools do server e elas viram tools **normais** no array `tools` (o LLM não sabe que vieram de MCP). Começou com `.defaultTools(toolCallbackProvider)` (global) e **evoluiu** para injetar `List<McpSyncClient>` e **selecionar tools por requisição** (`ToolUtil.selectToolsFor`), com um **filtro global** por cima (`McpToolFilter`, bloqueia server/tool na descoberta — §14.5). Servers de estudo: `mcpserverstdio` (stdio, `@McpTool` + `web-application-type=none`) e `mcpserverremote` (streamable, `:8090`).
 - **Capacidades MCP além de tools** (feitas só no `mcpserverremote`, via `McpSyncRequestContext` no server + handlers `@Mcp*` no client, casando pelo nome da conexão `artur`): **progress** (`ctx.progress` → `@McpProgress`) e **logging** (`ctx.info` → `@McpLogging`) = server manda notificações **de volta** ao client enquanto processa (§14.6); **sampling** (`ctx.sample` → `@McpSampling`) = server pede um **completion de LLM** ao client, usando a inteligência do host sem ter chave própria (§14.7); **elicitation** (`ctx.elicit` → `@McpElicitation`) = server pede um **dado estruturado ao usuário** (schema derivado de um `record`) antes de agir (§14.8). Sampling e elicitation invertem o fluxo: é o **server chamando de volta o client**.
+- **Multimodalidade** (`springai`) = mesmo ciclo do chat com **beans de model** dedicados e I/O **binário**: `TranscriptionModel` (Whisper, áudio→texto; `responseFormat=VTT` p/ legenda com timestamps), `TextToSpeechModel` (texto→`byte[]`, com voz/velocidade/formato) e `ImageModel` (texto→imagem base64). §15.
+- **AI Agent** (`support-agent-demo`, capstone) = LLM num **loop autônomo** `Reason→Act→Observe→Repeat` — dou meta + tools e o **Spring AI roda o loop** (`.defaultTools`), o modelo escolhe **quais** tools, em que **ordem** e **quando parar**. É **tool calling + MCP (streamable HTTP) + structured output + system prompt** juntos: um agente de suporte que faz polling numa caixa **Mailpit**, resolve o e-mail via tools do **`mcp-server`** (MySQL: consultar cliente/pedido/produto, detectar cobrança duplicada, checar garantia, histórico; **agir** = refund/logar ticket) e responde o cliente por SMTP (`AgentResponse` = `replyBody` + `operatorSummary`). Autonomia confiável vive no **system prompt** ("só o que as tools retornam", guardas de ação real) + separação leitura(`readOnly`)/escrita. §16.
